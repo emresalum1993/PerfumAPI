@@ -5,7 +5,8 @@ from .scrape import (
     scrape_fragrantica,
     scrape_fragrantica_by_brand,
     scrape_fragrantica_brands,
-    scrape_fragrantica_by_url
+    scrape_fragrantica_by_url,
+    scrape_fragrantica_reviews,
 )
 
 __all__ = [
@@ -13,5 +14,6 @@ __all__ = [
     'scrape_fragrantica',
     'scrape_fragrantica_by_brand',
     'scrape_fragrantica_brands',
-    'scrape_fragrantica_by_url'
+    'scrape_fragrantica_by_url',
+    'scrape_fragrantica_reviews',
 ]

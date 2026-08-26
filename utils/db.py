@@ -40,6 +40,8 @@ async def run_migration():
             notes_base TEXT[],
             rating REAL,
             votes INTEGER,
+            rating_breakdown JSONB,
+            when_to_wear JSONB,
             description TEXT,
             longevity TEXT,
             sillage TEXT,
@@ -53,6 +55,10 @@ async def run_migration():
         
         -- Create index on brand for filtering
         CREATE INDEX IF NOT EXISTS idx_perfumes_brand ON perfumes(brand);
+
+        ALTER TABLE perfumes
+            ADD COLUMN IF NOT EXISTS rating_breakdown JSONB,
+            ADD COLUMN IF NOT EXISTS when_to_wear JSONB;
         """
         
         # Execute migration using raw SQL
@@ -63,27 +69,8 @@ async def run_migration():
     except Exception as e:
         # Table might already exist or we're using a different approach
         print(f"⚠️  Migration note: {str(e)}")
-        print("💡 If table doesn't exist, create it manually in Supabase SQL Editor with:")
-        print("""
-        CREATE TABLE IF NOT EXISTS perfumes (
-            id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
-            name TEXT NOT NULL,
-            brand TEXT,
-            release_year INTEGER,
-            gender TEXT,
-            notes_top TEXT[],
-            notes_middle TEXT[],
-            notes_base TEXT[],
-            rating REAL,
-            votes INTEGER,
-            description TEXT,
-            longevity TEXT,
-            sillage TEXT,
-            image_url TEXT,
-            perfume_url TEXT UNIQUE,
-            created_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE('utc', NOW())
-        );
-        """)
+        print("💡 If table doesn't exist, create it manually in Supabase SQL Editor.")
+        print("💡 Also run migrations/002–005 (see SQL_HISTORY.MD).")
         return False
 
 
@@ -232,6 +219,77 @@ async def get_perfume_count() -> int:
         
     except Exception as e:
         print(f"❌ Error counting perfumes: {str(e)}")
+        return 0
+
+
+async def upsert_reviews(reviews: List[Dict[str, Any]]) -> int:
+    """
+    Upsert reviews by fragrantica_review_id.
+    """
+    if not reviews:
+        return 0
+    try:
+        response = supabase.table("reviews").upsert(
+            reviews,
+            on_conflict="fragrantica_review_id",
+        ).execute()
+        count = len(response.data) if response.data else 0
+        print(f"✅ Upserted {count} reviews")
+        return count
+    except Exception as e:
+        print(f"❌ Error upserting reviews: {str(e)}")
+        success = 0
+        for row in reviews:
+            try:
+                supabase.table("reviews").upsert(
+                    row,
+                    on_conflict="fragrantica_review_id",
+                ).execute()
+                success += 1
+            except Exception as inner:
+                print(f"❌ Error upserting review {row.get('fragrantica_review_id')}: {inner}")
+        return success
+
+
+async def get_reviews_by_perfume_id(
+    perfume_id: str,
+    *,
+    sentiment: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> List[Dict[str, Any]]:
+    """Fetch stored reviews for a perfume UUID."""
+    try:
+        query = (
+            supabase.table("reviews")
+            .select("*")
+            .eq("perfume_id", perfume_id)
+            .order("review_date", desc=True)
+            .range(offset, offset + limit - 1)
+        )
+        if sentiment:
+            query = query.eq("sentiment", sentiment)
+        response = query.execute()
+        return response.data if response.data else []
+    except Exception as e:
+        print(f"❌ Error fetching reviews for {perfume_id}: {str(e)}")
+        return []
+
+
+async def get_reviews_count(perfume_id: str, sentiment: Optional[str] = None) -> int:
+    """Count stored reviews for a perfume."""
+    try:
+        query = (
+            supabase.table("reviews")
+            .select("id", count="exact")
+            .eq("perfume_id", perfume_id)
+        )
+        if sentiment:
+            query = query.eq("sentiment", sentiment)
+        response = query.execute()
+        return response.count if hasattr(response, "count") else 0
+    except Exception as e:
+        print(f"❌ Error counting reviews: {str(e)}")
         return 0
 
 

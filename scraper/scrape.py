@@ -8,9 +8,26 @@ from bs4 import BeautifulSoup
 import time
 import json
 import os
-from typing import List, Dict, Any, Optional
+import sys
+from typing import List, Dict, Any, Optional, Tuple
 import re
 import random
+from urllib.parse import parse_qsl, urlparse
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from utils.fragrantica_crypto import (
+    decrypt_inline_var,
+    decrypt_cryptojs_blob,
+    status_to_rating_fields,
+    normalize_ai_opinions,
+    normalize_similar_perfumes,
+    normalize_reviews_payload,
+)
+
+
+# Known category keys on Fragrantica tw-rating-card sections (DOM fallback)
+SENTIMENT_KEYS = ('love', 'like', 'ok', 'dislike', 'hate')
+WHEN_TO_WEAR_KEYS = ('winter', 'spring', 'summer', 'fall', 'day', 'night')
 
 
 class FragranticaScraper:
@@ -31,6 +48,7 @@ class FragranticaScraper:
         self.retry_delay = 30  # Fixed retry delay for 429 errors
         self.request_count = 0  # Track requests for progressive slowdown
         self.last_url = None  # Track last URL for referer
+        self.last_html = None  # Raw HTML of last successful page fetch
         
         # Diverse User-Agent strings to rotate through
         self.user_agents = [
@@ -129,6 +147,7 @@ class FragranticaScraper:
                 time.sleep(actual_delay)
                 
                 # Use response.text to let requests handle encoding/decompression
+                self.last_html = response.text
                 return BeautifulSoup(response.text, 'html.parser')
                 
             except requests.exceptions.HTTPError as e:
@@ -136,6 +155,7 @@ class FragranticaScraper:
                     # Already handled above, continue to next attempt
                     continue
                 print(f"❌ HTTP Error fetching {url}: {str(e)}")
+                self.last_html = None
                 return None
             except Exception as e:
                 print(f"❌ Error fetching {url}: {str(e)}")
@@ -143,9 +163,11 @@ class FragranticaScraper:
                     print(f"🔄 Retrying in {self.delay} seconds...")
                     time.sleep(self.delay)
                     continue
+                self.last_html = None
                 return None
         
         print(f"❌ Failed to fetch {url} after {self.max_retries} attempts")
+        self.last_html = None
         return None
     
     def _extract_designer_id(self, brand_url: str) -> Optional[int]:
@@ -393,6 +415,201 @@ class FragranticaScraper:
         
         print(f"✅ Found {len(perfume_urls)} popular perfume URLs for {brand_name}")
         return perfume_urls[:limit]
+
+    @staticmethod
+    def _parse_vote_count(text: str) -> Optional[int]:
+        """Parse Fragrantica vote displays like '12.8k', '3k', '6500' into integers."""
+        if not text:
+            return None
+        cleaned = text.strip().lower().replace(',', '').replace('\u00a0', '')
+        match = re.match(r'^([\d.]+)\s*([km])?$', cleaned)
+        if not match:
+            return None
+        try:
+            value = float(match.group(1))
+        except ValueError:
+            return None
+        suffix = match.group(2)
+        if suffix == 'k':
+            value *= 1000
+        elif suffix == 'm':
+            value *= 1_000_000
+        return int(round(value))
+
+    @staticmethod
+    def _parse_percent_from_style(style: Optional[str]) -> Optional[float]:
+        """Extract percent from inline style width: 43.4549%;"""
+        if not style:
+            return None
+        match = re.search(r'width:\s*([\d.]+)\s*%', style, re.IGNORECASE)
+        if not match:
+            return None
+        try:
+            return round(float(match.group(1)), 4)
+        except ValueError:
+            return None
+
+    def _extract_card_category_entries(
+        self,
+        card,
+        allowed_keys: Tuple[str, ...],
+    ) -> Dict[str, Dict[str, Optional[float]]]:
+        """
+        Deterministically parse one .tw-rating-card into {key: {votes, percent}}.
+        Keys come from category label spans (love, winter, etc.), not SVG icons.
+        """
+        entries: Dict[str, Dict[str, Optional[float]]] = {}
+        allowed = set(allowed_keys)
+
+        for span in card.find_all('span'):
+            key = span.get_text(strip=True).lower()
+            if key not in allowed or key in entries:
+                continue
+
+            column = span.parent
+            if column is None:
+                continue
+
+            percent = None
+            bar = column.find('div', style=re.compile(r'width:\s*[\d.]+%', re.I))
+            if bar:
+                percent = self._parse_percent_from_style(bar.get('style'))
+
+            votes = None
+            for candidate in column.find_all('span'):
+                if candidate is span:
+                    continue
+                parsed = self._parse_vote_count(candidate.get_text(strip=True))
+                if parsed is not None:
+                    votes = parsed
+
+            entries[key] = {
+                'votes': votes,
+                'percent': percent,
+            }
+
+        # Keep stable key order for known categories
+        return {k: entries[k] for k in allowed_keys if k in entries}
+
+    def _extract_tw_rating_cards(self, soup: BeautifulSoup) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """
+        Extract sentiment (Rating) and season/time (When To Wear) cards.
+        Returns (rating_breakdown, when_to_wear).
+        """
+        rating_breakdown: Dict[str, Any] = {}
+        when_to_wear: Dict[str, Any] = {}
+
+        for card in soup.find_all(class_='tw-rating-card'):
+            label_el = card.find(class_='tw-rating-card-label')
+            if not label_el:
+                continue
+            label = label_el.get_text(strip=True).lower()
+
+            if label == 'rating':
+                rating_breakdown = self._extract_card_category_entries(card, SENTIMENT_KEYS)
+            elif 'when to wear' in label or label == 'when to wear':
+                when_to_wear = self._extract_card_category_entries(card, WHEN_TO_WEAR_KEYS)
+
+        return rating_breakdown, when_to_wear
+
+    def _extract_main_accords(self, soup: BeautifulSoup) -> List[str]:
+        """Extract main accords from SSR page text near the Main accords heading."""
+        texts: List[str] = []
+        heading_idx = None
+        # Prefer a local container around the heading
+        for el in soup.find_all(string=re.compile(r'^\s*main accords\s*$', re.I)):
+            container = el.find_parent('div')
+            for _ in range(3):
+                if container and container.parent and container.parent.name == 'div':
+                    container = container.parent
+            if container:
+                texts = [t.strip() for t in container.stripped_strings if t.strip()]
+            break
+
+        if not texts:
+            return []
+
+        for i, t in enumerate(texts):
+            if t.lower() == 'main accords':
+                heading_idx = i
+                break
+        if heading_idx is None:
+            return []
+
+        stop_prefixes = (
+            'search by accords',
+            'many items for sale',
+            'sponsored',
+            'user ratings',
+            'rating',
+            'when to wear',
+            'perfume rating',
+            'reviews',
+        )
+        accords: List[str] = []
+        for t in texts[heading_idx + 1:]:
+            lower = t.lower()
+            if any(lower.startswith(p) for p in stop_prefixes):
+                break
+            if re.fullmatch(r'[\d.,kKmM]+', t):
+                continue
+            if len(t) < 2 or len(t) > 30:
+                continue
+            if len(t.split()) > 3:
+                continue
+            if t not in accords:
+                accords.append(t)
+            if len(accords) >= 12:
+                break
+        return accords
+
+    def _extract_accord_breakdown(self, soup: BeautifulSoup) -> Dict[str, int]:
+        """Parse accord percentages from the 'Search by accords' link query string."""
+        link = soup.find("a", href=re.compile(r"/accords-search/\?"), string=re.compile(r"search by accords", re.I))
+        if not link:
+            link = soup.find("a", href=re.compile(r"/accords-search/\?"))
+        if not link or not link.get("href"):
+            return {}
+
+        parsed = urlparse(link["href"])
+        breakdown: Dict[str, int] = {}
+        for key, value in parse_qsl(parsed.query, keep_blank_values=False):
+            if key == "f_from_perfume_id":
+                continue
+            try:
+                percent = int(value)
+            except (TypeError, ValueError):
+                continue
+            accord = key.replace("+", " ").strip().lower()
+            if accord:
+                breakdown[accord] = percent
+        return breakdown
+
+    def _extract_perfumer(self, soup: BeautifulSoup) -> Optional[str]:
+        """Extract perfumer/nose from /noses/ links."""
+        for a in soup.find_all('a', href=re.compile(r'/noses/[^"]+\.html')):
+            name = a.get_text(strip=True)
+            if name and name.lower() not in {'perfumers', 'noses', 'perfumer'}:
+                return name
+        return None
+
+    def _extract_og_image(self, soup: BeautifulSoup, fragrantica_id: Optional[int] = None) -> Optional[str]:
+        """Prefer full bottle / social OG image over thumbnail."""
+        og_images = []
+        for tag in soup.find_all('meta', property=re.compile(r'^og:image')):
+            content = tag.get('content')
+            if content:
+                og_images.append(content)
+
+        for content in og_images:
+            if '/perfume/o.' in content:
+                return content
+        for content in og_images:
+            if 'perfume-social' in content or '/perfume/social.' in content:
+                return content
+        if fragrantica_id:
+            return f'https://fimgs.net/mdimg/perfume/o.{fragrantica_id}.jpg'
+        return og_images[0] if og_images else None
     
     def extract_perfume_details(self, url: str) -> Optional[Dict[str, Any]]:
         """
@@ -415,15 +632,31 @@ class FragranticaScraper:
                 'brand': None,
                 'release_year': None,
                 'gender': None,
+                'fragrantica_id': None,
+                'fragrance_family': None,
+                'perfumer': None,
+                'main_accords': [],
+                'accord_breakdown': None,
                 'notes_top': [],
                 'notes_middle': [],
                 'notes_base': [],
                 'rating': None,
                 'votes': None,
+                'rating_breakdown': None,
+                'when_to_wear': None,
+                'longevity_breakdown': None,
+                'sillage_breakdown': None,
+                'price_value': None,
+                'gender_votes': None,
+                'ownership': None,
+                'pros': None,
+                'cons': None,
+                'similar_perfumes': None,
                 'description': None,
                 'longevity': None,
                 'sillage': None,
-                'image_url': None
+                'image_url': None,
+                'image_url_og': None,
             }
             
             # Extract name and gender from h1 title
@@ -463,6 +696,13 @@ class FragranticaScraper:
                 brand_tag = soup.find('a', class_='brand')
             if brand_tag:
                 perfume_data['brand'] = brand_tag.get_text(strip=True)
+
+            # Strip duplicated brand suffix from name when present
+            if perfume_data.get('name') and perfume_data.get('brand'):
+                brand = perfume_data['brand']
+                name = perfume_data['name']
+                if name.lower().endswith(brand.lower()):
+                    perfume_data['name'] = name[: -len(brand)].strip()
             
             # Extract release year
             # First priority: Search in description for launch patterns (most reliable)
@@ -485,6 +725,24 @@ class FragranticaScraper:
                         if 1900 <= year <= 2030:  # Reasonable year range
                             perfume_data['release_year'] = year
                             break
+
+                # Fragrance family: "is a Oriental Floral fragrance"
+                family_match = re.search(
+                    r'is an?\s+(.+?)\s+fragrance\b',
+                    desc_text,
+                    re.IGNORECASE,
+                )
+                if family_match:
+                    perfume_data['fragrance_family'] = family_match.group(1).strip()
+
+                # Perfumer from description as fallback
+                nose_match = re.search(
+                    r'The nose behind this fragrance is\s+([^.]+)\.',
+                    desc_text,
+                    re.IGNORECASE,
+                )
+                if nose_match:
+                    perfume_data['perfumer'] = nose_match.group(1).strip()
             
             # Second priority: Look in the main info section
             if not perfume_data['release_year']:
@@ -611,6 +869,65 @@ class FragranticaScraper:
                     perfume_data['votes'] = int(votes_tag.get_text(strip=True).replace(',', ''))
                 except ValueError:
                     pass
+
+            # Primary source for sentiment / when-to-wear / longevity / sillage:
+            # encrypted `let status = {ct,iv,s}` blob (Vue cards are empty shells in SSR HTML).
+            html = self.last_html or ""
+            status_payload = decrypt_inline_var(html, "status")
+            if status_payload:
+                derived = status_to_rating_fields(status_payload)
+                for key in (
+                    "fragrantica_id",
+                    "rating_breakdown",
+                    "when_to_wear",
+                    "longevity_breakdown",
+                    "sillage_breakdown",
+                    "price_value",
+                    "gender_votes",
+                    "ownership",
+                    "rating",
+                    "votes",
+                    "longevity",
+                    "sillage",
+                ):
+                    if derived.get(key) is not None:
+                        perfume_data[key] = derived[key]
+            else:
+                # DOM fallback if status blob missing / passphrase rotated
+                rating_breakdown, when_to_wear = self._extract_tw_rating_cards(soup)
+                if rating_breakdown:
+                    perfume_data['rating_breakdown'] = rating_breakdown
+                if when_to_wear:
+                    perfume_data['when_to_wear'] = when_to_wear
+
+            # Pros / cons + similar perfumes (encrypted blobs)
+            opinions = normalize_ai_opinions(decrypt_inline_var(html, "ai_opinions"))
+            if opinions.get("pros"):
+                perfume_data["pros"] = opinions["pros"]
+            if opinions.get("cons"):
+                perfume_data["cons"] = opinions["cons"]
+
+            similars = normalize_similar_perfumes(decrypt_inline_var(html, "similar_perfumes"))
+            if similars:
+                perfume_data["similar_perfumes"] = similars
+
+            # Main accords + perfumer from SSR HTML
+            accords = self._extract_main_accords(soup)
+            if accords:
+                perfume_data["main_accords"] = accords
+            accord_breakdown = self._extract_accord_breakdown(soup)
+            if accord_breakdown:
+                perfume_data["accord_breakdown"] = accord_breakdown
+
+            perfumer = self._extract_perfumer(soup)
+            if perfumer:
+                perfume_data["perfumer"] = perfumer
+
+            # Prefer fragrantica_id from URL if still missing
+            if not perfume_data.get("fragrantica_id"):
+                id_match = re.search(r'-(\d+)\.html(?:$|\?)', url)
+                if id_match:
+                    perfume_data["fragrantica_id"] = int(id_match.group(1))
             
             # Extract description with proper formatting
             desc_container = soup.find('div', itemprop='description')
@@ -644,45 +961,45 @@ class FragranticaScraper:
                     # Limit total length to prevent extremely long descriptions
                     perfume_data['description'] = full_description[:2000]
             
-            # Extract longevity rating (0-10 scale)
-            # Look for: <p style="color: #83a6c4;">Perfume longevity:<span>2.86</span> out of<span>5</span>.</p>
+            # Extract longevity/sillage from blue paragraphs only if status blob didn't provide them
             blue_p_tags = soup.find_all('p', style=re.compile(r'color:\s*#83a6c4'))
-            for p_tag in blue_p_tags:
-                p_text = p_tag.get_text()
-                if 'perfume longevity:' in p_text.lower():
-                    spans = p_tag.find_all('span')
-                    if len(spans) >= 2:
-                        try:
-                            longevity_value = float(spans[0].get_text(strip=True))
-                            max_value = float(spans[1].get_text(strip=True))
-                            # Convert to 0-10 scale
-                            if max_value > 0:
-                                perfume_data['longevity'] = round((longevity_value / max_value) * 10, 1)
-                        except (ValueError, ZeroDivisionError):
-                            pass
-                    break
-            
-            # Extract sillage rating (0-10 scale)  
-            # Look for: <p style="color: #83a6c4;">Perfume sillage:<span>2.38</span> out of<span>4</span>.</p>
-            for p_tag in blue_p_tags:
-                p_text = p_tag.get_text()
-                if 'perfume sillage:' in p_text.lower():
-                    spans = p_tag.find_all('span')
-                    if len(spans) >= 2:
-                        try:
-                            sillage_value = float(spans[0].get_text(strip=True))
-                            max_value = float(spans[1].get_text(strip=True))
-                            # Convert to 0-10 scale
-                            if max_value > 0:
-                                perfume_data['sillage'] = round((sillage_value / max_value) * 10, 1)
-                        except (ValueError, ZeroDivisionError):
-                            pass
-                    break
+            if perfume_data.get('longevity') is None:
+                for p_tag in blue_p_tags:
+                    p_text = p_tag.get_text()
+                    if 'perfume longevity:' in p_text.lower():
+                        spans = p_tag.find_all('span')
+                        if len(spans) >= 2:
+                            try:
+                                longevity_value = float(spans[0].get_text(strip=True))
+                                max_value = float(spans[1].get_text(strip=True))
+                                if max_value > 0:
+                                    perfume_data['longevity'] = round((longevity_value / max_value) * 10, 1)
+                            except (ValueError, ZeroDivisionError):
+                                pass
+                        break
+
+            if perfume_data.get('sillage') is None:
+                for p_tag in blue_p_tags:
+                    p_text = p_tag.get_text()
+                    if 'perfume sillage:' in p_text.lower():
+                        spans = p_tag.find_all('span')
+                        if len(spans) >= 2:
+                            try:
+                                sillage_value = float(spans[0].get_text(strip=True))
+                                max_value = float(spans[1].get_text(strip=True))
+                                if max_value > 0:
+                                    perfume_data['sillage'] = round((sillage_value / max_value) * 10, 1)
+                            except (ValueError, ZeroDivisionError):
+                                pass
+                        break
             
             # Extract image URL
             img_tag = soup.find('img', itemprop='image')
             if img_tag and 'src' in img_tag.attrs:
                 perfume_data['image_url'] = img_tag['src']
+
+            # Higher-quality / social image
+            perfume_data['image_url_og'] = self._extract_og_image(soup, perfume_data.get('fragrantica_id'))
             
             print(f"✅ Extracted: {perfume_data.get('name', 'Unknown')} by {perfume_data.get('brand', 'Unknown')}")
             return perfume_data
@@ -871,7 +1188,139 @@ class FragranticaScraper:
             self.save_to_json([perfume_data])
         
         return perfume_data
-    
+
+    def _post_reviews_ajax(self, form: Dict[str, str], referer: str) -> Optional[Dict[str, Any]]:
+        """POST reviews4perfume_v2 and decrypt the CryptoJS response."""
+        ts = int(time.time() * 1000)
+        url = f"{self.base_url}/ajax.php?reviews4perfume_v2&{ts}"
+        self.session.headers["User-Agent"] = random.choice(self.user_agents)
+        self.session.headers["Referer"] = referer
+        self.session.headers["Origin"] = self.base_url
+        self.session.headers["Accept"] = "application/json, text/plain, */*"
+        self.session.headers["Content-Type"] = "application/x-www-form-urlencoded"
+        self.session.headers["Sec-Fetch-Dest"] = "empty"
+        self.session.headers["Sec-Fetch-Mode"] = "cors"
+        self.session.headers["Sec-Fetch-Site"] = "same-origin"
+
+        response = self.session.post(url, data=form, timeout=20)
+        if response.status_code == 429:
+            print(f"⚠️  Reviews rate limited (429). Waiting {self.retry_delay}s...")
+            time.sleep(self.retry_delay)
+            response = self.session.post(url, data=form, timeout=20)
+
+        response.raise_for_status()
+        blob = response.json()
+        if not isinstance(blob, dict) or "ct" not in blob:
+            raise ValueError("Unexpected reviews response (not a CryptoJS blob)")
+        return decrypt_cryptojs_blob(blob)
+
+    def scrape_reviews(
+        self,
+        *,
+        perfume_uuid: str,
+        fragrantica_id: int,
+        perfume_url: str,
+        sentiment: str = "positive",
+        pages: int = 5,
+        page_delay: float = 2.5,
+    ) -> Dict[str, Any]:
+        """
+        Scrape reviews for a perfume via reviews4perfume_v2 AJAX.
+
+        Args:
+            perfume_uuid: Our DB perfume UUID (stored on each review row)
+            fragrantica_id: Fragrantica numeric perfume id
+            perfume_url: Perfume page URL (used as referer / session warm-up)
+            sentiment: 'positive' or 'negative'
+            pages: Max pages to fetch (Fragrantica typically caps at 5)
+            page_delay: Delay between paginated AJAX calls
+
+        Returns:
+            Dict with reviews list and scrape metadata
+        """
+        sentiment = (sentiment or "positive").strip().lower()
+        if sentiment not in ("positive", "negative"):
+            raise ValueError("sentiment must be 'positive' or 'negative'")
+
+        pages = max(1, int(pages))
+        print(
+            f"📝 Scraping up to {pages} page(s) of {sentiment} reviews "
+            f"for fragrantica_id={fragrantica_id}"
+        )
+
+        # Warm session / cookies by loading the perfume page first
+        soup = self._get_page(perfume_url)
+        if soup is None:
+            raise RuntimeError(f"Failed to load perfume page: {perfume_url}")
+
+        all_reviews: List[Dict[str, Any]] = []
+        pages_fetched = 0
+        has_more = False
+        next_token: Optional[str] = None
+
+        for page_idx in range(pages):
+            if page_idx == 0:
+                form = {
+                    "action": "reviews4perfume_v2",
+                    "perfume_id": str(fragrantica_id),
+                    "sentiment": sentiment,
+                }
+            else:
+                if not next_token:
+                    break
+                form = {
+                    "action": "reviews4perfume_v2",
+                    "token": next_token,
+                }
+                time.sleep(page_delay)
+
+            print(f"📡 Reviews AJAX page {page_idx + 1}/{pages} ({sentiment})")
+            payload = self._post_reviews_ajax(form, referer=perfume_url)
+            if not payload:
+                break
+
+            batch = normalize_reviews_payload(
+                payload,
+                perfume_uuid=perfume_uuid,
+                sentiment=sentiment,
+            )
+            all_reviews.extend(batch)
+            pages_fetched += 1
+
+            pagination = payload.get("pagination") or {}
+            has_more = bool(pagination.get("has_more"))
+            next_token = pagination.get("next_token")
+            max_pages = pagination.get("max_pages")
+            print(
+                f"   → {len(batch)} reviews (total {len(all_reviews)}); "
+                f"has_more={has_more} max_pages={max_pages}"
+            )
+
+            if not has_more or not next_token:
+                break
+            if max_pages is not None and pages_fetched >= int(max_pages):
+                break
+
+        # Deduplicate by fragrantica_review_id (keep first)
+        seen = set()
+        unique: List[Dict[str, Any]] = []
+        for row in all_reviews:
+            rid = row["fragrantica_review_id"]
+            if rid in seen:
+                continue
+            seen.add(rid)
+            unique.append(row)
+
+        print(f"✅ Scraped {len(unique)} unique reviews across {pages_fetched} page(s)")
+        return {
+            "reviews": unique,
+            "pages_fetched": pages_fetched,
+            "has_more": has_more,
+            "sentiment": sentiment,
+            "fragrantica_id": fragrantica_id,
+            "perfume_id": perfume_uuid,
+        }
+
     def save_to_json(self, perfumes: List[Dict[str, Any]], filename: str = "data/data.json"):
         """
         Save perfume data to JSON file.
@@ -950,6 +1399,29 @@ def scrape_fragrantica_by_url(perfume_url: str) -> Optional[Dict[str, Any]]:
     """
     scraper = FragranticaScraper(delay=17.0)
     return scraper.scrape_perfume_by_url(perfume_url, save_to_file=True)
+
+
+def scrape_fragrantica_reviews(
+    *,
+    perfume_uuid: str,
+    fragrantica_id: int,
+    perfume_url: str,
+    sentiment: str = "positive",
+    pages: int = 5,
+) -> Dict[str, Any]:
+    """
+    Convenience function to scrape reviews for one perfume.
+
+    Uses a shorter base delay than full perfume scrapes; pagination uses ~2.5s gaps.
+    """
+    scraper = FragranticaScraper(delay=5.0)
+    return scraper.scrape_reviews(
+        perfume_uuid=perfume_uuid,
+        fragrantica_id=fragrantica_id,
+        perfume_url=perfume_url,
+        sentiment=sentiment,
+        pages=pages,
+    )
 
 
 if __name__ == "__main__":

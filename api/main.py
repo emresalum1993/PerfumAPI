@@ -3,10 +3,11 @@ FastAPI application for Perfume Data API.
 Serves scraped perfume data from Supabase with authentication.
 """
 
-from fastapi import FastAPI, HTTPException, Depends, Query
+from fastapi import FastAPI, HTTPException, Depends, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, field_validator
+from typing import List, Optional, Dict, Any, Union
 from dotenv import load_dotenv
 import os
 import sys
@@ -22,14 +23,18 @@ from utils.db import (
     get_all_perfumes,
     get_perfume_by_id,
     search_perfumes,
-    get_perfume_count
+    get_perfume_count,
+    upsert_reviews,
+    get_reviews_by_perfume_id,
+    get_reviews_count,
 )
 from utils.auth import get_current_user, verify_admin
 from scraper.scrape import (
     scrape_fragrantica,
     scrape_fragrantica_by_brand,
     scrape_fragrantica_brands,
-    scrape_fragrantica_by_url
+    scrape_fragrantica_by_url,
+    scrape_fragrantica_reviews,
 )
 
 # Load environment variables
@@ -70,16 +75,44 @@ class PerfumeBase(BaseModel):
     brand: Optional[str] = None
     release_year: Optional[int] = None
     gender: Optional[str] = None
+    fragrantica_id: Optional[int] = None
+    fragrance_family: Optional[str] = None
+    perfumer: Optional[str] = None
+    main_accords: List[str] = Field(default_factory=list)
+    accord_breakdown: Optional[Dict[str, int]] = None
     notes_top: List[str] = Field(default_factory=list)
     notes_middle: List[str] = Field(default_factory=list)
     notes_base: List[str] = Field(default_factory=list)
     rating: Optional[float] = None
     votes: Optional[int] = None
+    rating_breakdown: Optional[Dict[str, Any]] = None
+    when_to_wear: Optional[Dict[str, Any]] = None
+    longevity_breakdown: Optional[Dict[str, Any]] = None
+    sillage_breakdown: Optional[Dict[str, Any]] = None
+    price_value: Optional[Dict[str, Any]] = None
+    gender_votes: Optional[Dict[str, Any]] = None
+    ownership: Optional[Dict[str, Any]] = None
+    pros: Optional[List[Dict[str, Any]]] = None
+    cons: Optional[List[Dict[str, Any]]] = None
+    similar_perfumes: Optional[List[Dict[str, Any]]] = None
     description: Optional[str] = None
-    longevity: Optional[str] = None
-    sillage: Optional[str] = None
+    longevity: Optional[Union[str, float, int]] = None
+    sillage: Optional[Union[str, float, int]] = None
     image_url: Optional[str] = None
+    image_url_og: Optional[str] = None
     perfume_url: Optional[str] = None
+
+    @field_validator(
+        "main_accords",
+        "notes_top",
+        "notes_middle",
+        "notes_base",
+        mode="before",
+    )
+    @classmethod
+    def empty_list_if_none(cls, value):
+        """DB NULLs from older rows should serialize as []."""
+        return value if value is not None else []
 
 
 class PerfumeCreate(PerfumeBase):
@@ -135,6 +168,54 @@ class PerfumeListResponse(BaseModel):
     perfumes: List[PerfumeResponse]
 
 
+class ReviewResponse(BaseModel):
+    """Stored Fragrantica review"""
+    id: str
+    perfume_id: str
+    fragrantica_review_id: int
+    fragrantica_perfume_id: Optional[int] = None
+    sentiment: str
+    username: Optional[str] = None
+    user_id: Optional[int] = None
+    content_html: Optional[str] = None
+    content_text: Optional[str] = None
+    vote_yes: Optional[int] = None
+    vote_no: Optional[int] = None
+    karma_score: Optional[float] = None
+    review_date: Optional[str] = None
+    perfume_votes: Optional[Dict[str, Any]] = None
+    member_url: Optional[str] = None
+    avatar_url: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ReviewListResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    perfume_id: str
+    sentiment: Optional[str] = None
+    reviews: List[ReviewResponse]
+
+
+class ScrapeReviewsResponse(BaseModel):
+    status: str
+    message: str
+    perfume_id: str
+    fragrantica_id: int
+    sentiment: str
+    pages_requested: int
+    pages_fetched: int
+    has_more: bool
+    scraped_count: int
+    inserted_count: int
+    reviews: List[Dict[str, Any]] = Field(default_factory=list)
+
+
 # Startup event
 @app.on_event("startup")
 async def startup_event():
@@ -158,7 +239,9 @@ async def root():
             "scrape": "/scrape (auth required)",
             "scrape_brand": "/scrape/brand (auth required)",
             "scrape_brands": "/scrape/brands (auth required)",
-            "scrape_url": "/scrape/url (auth required)"
+            "scrape_url": "/scrape/url (auth required)",
+            "scrape_reviews": "/scrape/reviews/{perfume_id}?pages=&sentiment= (auth required)",
+            "perfume_reviews": "/perfumes/{perfume_id}/reviews",
         }
     }
 
@@ -221,6 +304,41 @@ async def get_perfume(perfume_id: str):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching perfume: {str(e)}")
+
+
+@app.get("/perfumes/{perfume_id}/reviews", response_model=ReviewListResponse, tags=["Reviews"])
+async def list_perfume_reviews(
+    perfume_id: str,
+    sentiment: Optional[str] = Query(
+        default=None,
+        pattern="^(positive|negative)$",
+        description="Optional filter: positive or negative",
+    ),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+):
+    """
+    List stored reviews for a perfume (by our DB UUID).
+    """
+    perfume = await get_perfume_by_id(perfume_id)
+    if not perfume:
+        raise HTTPException(status_code=404, detail=f"Perfume with ID {perfume_id} not found")
+
+    reviews = await get_reviews_by_perfume_id(
+        perfume_id,
+        sentiment=sentiment,
+        limit=limit,
+        offset=offset,
+    )
+    total = await get_reviews_count(perfume_id, sentiment=sentiment)
+    return {
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "perfume_id": perfume_id,
+        "sentiment": sentiment,
+        "reviews": reviews,
+    }
 
 
 @app.get("/perfumes/search/{query}", response_model=List[PerfumeResponse], tags=["Perfumes"])
@@ -508,6 +626,92 @@ async def scrape_by_url(
         )
 
 
+@app.post(
+    "/scrape/reviews/{perfume_id}",
+    response_model=ScrapeReviewsResponse,
+    tags=["Scraper (Auth Required)"],
+)
+async def scrape_perfume_reviews(
+    perfume_id: str,
+    pages: int = Query(
+        default=5,
+        ge=1,
+        le=20,
+        description="Number of review pages to fetch (default 5; Fragrantica often caps at 5)",
+    ),
+    sentiment: str = Query(
+        default="positive",
+        pattern="^(positive|negative)$",
+        description="Review sentiment filter: positive or negative",
+    ),
+    current_user: Dict[str, Any] = Depends(verify_admin),
+):
+    """
+    Scrape Fragrantica reviews for a perfume already in the database.
+
+    - **perfume_id**: Our DB UUID (must have `fragrantica_id` and `perfume_url`)
+    - **pages**: Max AJAX pages to follow via next_token (default: 5)
+    - **sentiment**: `positive` or `negative` (default: positive)
+
+    Decrypts CryptoJS `{ct,iv,s}` responses and upserts into `reviews`.
+    """
+    perfume = await get_perfume_by_id(perfume_id)
+    if not perfume:
+        raise HTTPException(status_code=404, detail=f"Perfume with ID {perfume_id} not found")
+
+    fragrantica_id = perfume.get("fragrantica_id")
+    perfume_url = perfume.get("perfume_url")
+    if not fragrantica_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Perfume is missing fragrantica_id; scrape the perfume page first",
+        )
+    if not perfume_url:
+        raise HTTPException(
+            status_code=400,
+            detail="Perfume is missing perfume_url; needed as AJAX referer",
+        )
+
+    print(
+        f"📝 Review scrape perfume={perfume_id} fragrantica_id={fragrantica_id} "
+        f"pages={pages} sentiment={sentiment} user={current_user.get('id', 'unknown')}"
+    )
+
+    try:
+        result = await asyncio.to_thread(
+            scrape_fragrantica_reviews,
+            perfume_uuid=perfume_id,
+            fragrantica_id=int(fragrantica_id),
+            perfume_url=perfume_url,
+            sentiment=sentiment,
+            pages=pages,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error scraping reviews: {str(e)}")
+
+    reviews = result.get("reviews") or []
+    inserted_count = await upsert_reviews(reviews)
+
+    return {
+        "status": "success" if reviews else "error",
+        "message": (
+            f"Scraped {len(reviews)} {sentiment} reviews "
+            f"({result.get('pages_fetched', 0)}/{pages} pages)"
+            if reviews
+            else "No reviews scraped"
+        ),
+        "perfume_id": perfume_id,
+        "fragrantica_id": int(fragrantica_id),
+        "sentiment": sentiment,
+        "pages_requested": pages,
+        "pages_fetched": int(result.get("pages_fetched") or 0),
+        "has_more": bool(result.get("has_more")),
+        "scraped_count": len(reviews),
+        "inserted_count": inserted_count,
+        "reviews": reviews,
+    }
+
+
 # Statistics endpoint (public)
 @app.get("/stats", tags=["Statistics"])
 async def get_stats():
@@ -528,23 +732,29 @@ async def get_stats():
 
 # Error handlers
 @app.exception_handler(404)
-async def not_found_handler(request, exc):
+async def not_found_handler(request: Request, exc):
     """Custom 404 handler"""
-    return {
-        "error": "Not Found",
-        "message": "The requested resource was not found",
-        "path": str(request.url)
-    }
+    return JSONResponse(
+        status_code=404,
+        content={
+            "error": "Not Found",
+            "message": "The requested resource was not found",
+            "path": str(request.url),
+        },
+    )
 
 
 @app.exception_handler(500)
-async def internal_error_handler(request, exc):
+async def internal_error_handler(request: Request, exc):
     """Custom 500 handler"""
-    return {
-        "error": "Internal Server Error",
-        "message": "An unexpected error occurred",
-        "path": str(request.url)
-    }
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "Internal Server Error",
+            "message": "An unexpected error occurred",
+            "path": str(request.url),
+        },
+    )
 
 
 if __name__ == "__main__":
