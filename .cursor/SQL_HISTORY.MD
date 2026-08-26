@@ -86,7 +86,7 @@ Not: RLS policy’leri dosyada yorum satırı; production’da ayrıca açılmad
 
 | | |
 |---|---|
-| **Durum** | Yeni — SQL Editor’de çalıştır |
+| **Durum** | Uygulandı |
 | **Ne yaptı** | `pg_trgm` extension + `reviews.content_text` üzerinde GIN trigram index |
 | **Neden** | `SQL_SCHEMAS.MD`’deki `idx_reviews_text_trgm` ile hizalamak; review metninde `ILIKE '%…%'` / similarity aramayı hızlandırmak |
 | **SQL özeti** | `CREATE EXTENSION IF NOT EXISTS pg_trgm;` + `CREATE INDEX IF NOT EXISTS idx_reviews_text_trgm ON reviews USING GIN (content_text gin_trgm_ops);` |
@@ -96,22 +96,42 @@ Not: RLS policy’leri dosyada yorum satırı; production’da ayrıca açılmad
 
 ---
 
-## Henüz migration olmayan şema (SQL_SCHEMAS.MD v0.3 — 1–6)
+## 006 — `006_widen_emotion_lexicon_scores.sql`
 
-Aşağıdakiler tam şemada tanımlı; **ayrı migration dosyası yok** (henüz scrape API’sinin parçası değil).
-İlk mood migration’ı yazılırken **v0.3** yapısını kullan (eski `is_gate` / 10 kategori seed’i kopyalama).
+| | |
+|---|---|
+| **Durum** | Opsiyonel — gerekmez (pipeline raw −1..+1 saklar, skor anında 0–100’e çevirir) |
+| **Ne yaptı** | `emotion_lexicon` VAD kolonlarını `numeric(5,2)` yapardı (0–100 saklamak için) |
+| **Not** | Mevcut kod raw NRC değerleriyle `numeric(4,2)` üzerinde çalışır; `006` yalnızca DB’de 0–100 tutmak istersen |
+| **Şema eşlemesi** | `SQL_SCHEMAS.MD` katman 3 (raw −1..+1) |
+
+---
+
+## 007 — `007_create_perfume_opinion_scores.sql`
+
+| | |
+|---|---|
+| **Durum** | Yeni — SQL Editor’de çalıştır (opinion scoring öncesi) |
+| **Ne yaptı** | `perfume_opinion_scores` — karakter-ilgili pros/cons LLM+lexicon skorları |
+| **Neden** | Mood posterior’a review’larla aynı havuzda katkı |
+| **Bağımlılık** | `perfumes` |
+| **Şema eşlemesi** | `SQL_SCHEMAS.MD` katman 4 |
+
+---
+
+## Henüz migration dosyası olmayan şema (SQL_SCHEMAS.MD v0.3 — 1–6)
+
+**Durum (2026-08-26):** Üst katman 1 / 1b / 2 / 4 tabloları + seed DB’de. Katman 3 (`emotion_lexicon`) NRC-VAD ile dolu. `007` opinion skor tablosu.
 
 | Katman | Tablolar | Ne zaman migrate edilir | v0.3 notu |
 |--------|----------|-------------------------|-----------|
 | 1 Mod reçetesi | `mood_axes`, `mood_labels`, `mood_label_weights` | Mood motoru | `mood_axes` = 6 eksen; `is_gate` kolonu yok |
 | 1b Kalite | `quality_gates` | Mood pipeline | Gate’ler ayrı tablo; weight FK’larına bağlanmaz |
 | 2 Nota taksonomisi | `note_categories`, `note_aliases`, `note_category_axis_weights` | Wheel / mapping | **30** Fragrantica wheel kategorisi + seed |
-| 3 Sözlük | `emotion_lexicon` | Lexicon yöntemi | Opsiyonel |
-| 4 Skor | `perfume_mood_scores`, `review_axis_scores` | Batch skor job | `review_axis_scores.axis_key` FK’siz (mood ∪ gate) |
+| 3 Sözlük | `emotion_lexicon` | Lexicon yöntemi | NRC-VAD unigrams; `006` numeric widen |
+| 4 Skor | `perfume_mood_scores`, `review_axis_scores`, `perfume_opinion_scores` | Batch skor job | `method` ∈ llm, lexicon |
 | 5 Ticari | `retailers`, `purchase_links`, `link_clicks` | Affiliate | — |
 | 6 Uygulama | `user_selections`, `user_mood_selections` | Kullanıcı seçimleri | — |
-
-Bunlar için yeni `006+` migration’lar yazıldığında bu dosyaya bölüm ekle.
 
 ---
 
@@ -123,4 +143,6 @@ Bunlar için yeni `006+` migration’lar yazıldığında bu dosyaya bölüm ekl
 003  extended perfume fields (+ accord_breakdown)
 004  reviews
 005  reviews.content_text pg_trgm GIN
+006  emotion_lexicon numeric(5,2) widen (opsiyonel)
+007  perfume_opinion_scores
 ```

@@ -208,8 +208,8 @@ create table emotion_lexicon (
     id         uuid primary key default gen_random_uuid(),
     word       text not null,
     language   text not null,
-    valence    numeric(4,2),
-    arousal    numeric(4,2),
+    valence    numeric(4,2),   -- NRC-VAD raw −1..+1 (app rescales to 0–100 at score time)
+    arousal    numeric(4,2),   -- stored; unused in current mood blend
     dominance  numeric(4,2),
     source     text not null,
     unique (word, language, source)
@@ -249,6 +249,23 @@ create table review_axis_scores (
 );
 
 create index review_axis_scores_review_idx on review_axis_scores (review_id);
+
+-- Fragrantica pros/cons (character-relevant only) — blended into mood posteriors
+-- alongside reviews. axis_key FK’siz (mood ∪ gate), aynı review_axis_scores deseni.
+create table perfume_opinion_scores (
+    id                 uuid primary key default gen_random_uuid(),
+    perfume_id         uuid not null references perfumes(id) on delete cascade,
+    opinion_type       text not null check (opinion_type in ('pro', 'con')),
+    opinion_text       text not null,
+    fragrantica_score  integer not null,
+    axis_key           text not null,
+    score              numeric(5,2) not null,
+    method             text not null check (method in ('lexicon', 'llm')),
+    computed_at        timestamptz not null default now(),
+    unique (perfume_id, opinion_text, axis_key, method)
+);
+
+create index perfume_opinion_scores_perfume_idx on perfume_opinion_scores (perfume_id);
 
 
 -- =====================================================================

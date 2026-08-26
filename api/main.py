@@ -27,6 +27,7 @@ from utils.db import (
     upsert_reviews,
     get_reviews_by_perfume_id,
     get_reviews_count,
+    supabase,
 )
 from utils.auth import get_current_user, verify_admin
 from scraper.scrape import (
@@ -36,6 +37,16 @@ from scraper.scrape import (
     scrape_fragrantica_by_url,
     scrape_fragrantica_reviews,
 )
+from pipeline import (
+    check_unmapped,
+    score_reviews,
+    compute_moods,
+    backfill_lexicon_scores,
+    lexicon_check,
+    score_opinions,
+)
+from pipeline.constants import DEFAULT_SCORE_LIMIT, MAX_SCORE_LIMIT
+
 
 # Load environment variables
 load_dotenv()
@@ -242,6 +253,15 @@ async def root():
             "scrape_url": "/scrape/url (auth required)",
             "scrape_reviews": "/scrape/reviews/{perfume_id}?pages=&sentiment= (auth required)",
             "perfume_reviews": "/perfumes/{perfume_id}/reviews",
+            "perfume_moods": "/perfumes/{perfume_id}/moods",
+            "perfume_summary": "/perfumes/{perfume_id}/summary",
+            "perfume_lexicon_check": "/perfumes/{perfume_id}/lexicon-check",
+            "pipeline_notes": "/pipeline/notes/check-unmapped (auth)",
+            "pipeline_score": "/pipeline/reviews/score (auth)",
+            "pipeline_score_lexicon": "/pipeline/reviews/score-lexicon (auth)",
+            "pipeline_opinions": "/pipeline/opinions/score (auth)",
+            "pipeline_moods": "/pipeline/moods/compute (auth)",
+            "pipeline_run_all": "/pipeline/run-all (auth)",
         }
     }
 
@@ -709,6 +729,283 @@ async def scrape_perfume_reviews(
         "scraped_count": len(reviews),
         "inserted_count": inserted_count,
         "reviews": reviews,
+    }
+
+
+@app.get("/perfumes/{perfume_id}/moods", tags=["Moods"])
+async def get_perfume_moods(perfume_id: str):
+    """Public: stored perfume_mood_scores for one perfume."""
+    perfume = await get_perfume_by_id(perfume_id)
+    if not perfume:
+        raise HTTPException(status_code=404, detail=f"Perfume with ID {perfume_id} not found")
+    try:
+        response = (
+            supabase.table("perfume_mood_scores")
+            .select("*")
+            .eq("perfume_id", perfume_id)
+            .order("score", desc=True)
+            .execute()
+        )
+        return {
+            "perfume_id": perfume_id,
+            "moods": response.data or [],
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching moods: {str(e)}")
+
+
+@app.get("/perfumes/{perfume_id}/summary", tags=["Perfumes"])
+async def get_perfume_summary(perfume_id: str):
+    """
+    Public compact card: identity + top accords + computed mood snapshot.
+    Omits full notes, reviews, similar list, and raw breakdowns.
+    """
+    perfume = await get_perfume_by_id(perfume_id)
+    if not perfume:
+        raise HTTPException(status_code=404, detail=f"Perfume with ID {perfume_id} not found")
+
+    try:
+        mood_resp = (
+            supabase.table("perfume_mood_scores")
+            .select("mood_key,score,sample_size,confidence,gated_out,computed_at")
+            .eq("perfume_id", perfume_id)
+            .order("score", desc=True)
+            .execute()
+        )
+        mood_rows = mood_resp.data or []
+
+        breakdown = perfume.get("accord_breakdown") or {}
+        if isinstance(breakdown, dict) and breakdown:
+            top_accords = [
+                {"name": name, "pct": int(pct)}
+                for name, pct in sorted(
+                    breakdown.items(),
+                    key=lambda item: int(item[1]) if item[1] is not None else 0,
+                    reverse=True,
+                )[:5]
+            ]
+        else:
+            top_accords = [
+                {"name": name, "pct": None}
+                for name in (perfume.get("main_accords") or [])[:5]
+            ]
+
+        moods = [
+            {
+                "mood_key": row["mood_key"],
+                "score": float(row["score"]) if row.get("score") is not None else None,
+                "confidence": row.get("confidence"),
+                "gated_out": bool(row.get("gated_out")),
+            }
+            for row in mood_rows
+        ]
+        active = [m for m in moods if not m["gated_out"]]
+        top_mood = (active or moods)[0] if moods else None
+
+        sample_size = mood_rows[0].get("sample_size") if mood_rows else 0
+        confidence = mood_rows[0].get("confidence") if mood_rows else None
+        gated_out = bool(mood_rows[0].get("gated_out")) if mood_rows else False
+        computed_at = mood_rows[0].get("computed_at") if mood_rows else None
+
+        reviews_total = await get_reviews_count(perfume_id)
+
+        return {
+            "perfume_id": perfume_id,
+            "name": perfume.get("name"),
+            "brand": perfume.get("brand"),
+            "gender": perfume.get("gender"),
+            "release_year": perfume.get("release_year"),
+            "image_url": perfume.get("image_url"),
+            "perfume_url": perfume.get("perfume_url"),
+            "rating": perfume.get("rating"),
+            "votes": perfume.get("votes"),
+            "longevity": perfume.get("longevity"),
+            "sillage": perfume.get("sillage"),
+            "top_accords": top_accords,
+            "top_mood": top_mood,
+            "moods": moods,
+            "sample_size": sample_size,
+            "confidence": confidence,
+            "gated_out": gated_out,
+            "computed_at": computed_at,
+            "reviews_total": reviews_total,
+            "has_moods": bool(moods),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching summary: {str(e)}")
+
+
+@app.get("/perfumes/{perfume_id}/lexicon-check", tags=["Moods"])
+async def get_perfume_lexicon_check(perfume_id: str):
+    """
+    Public transparency: LLM vs NRC-VAD lexicon vs blended valence/dominance.
+    """
+    perfume = await get_perfume_by_id(perfume_id)
+    if not perfume:
+        raise HTTPException(status_code=404, detail=f"Perfume with ID {perfume_id} not found")
+    try:
+        return await asyncio.to_thread(lexicon_check, perfume_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lexicon check failed: {str(e)}")
+
+
+@app.post("/pipeline/notes/check-unmapped", tags=["Pipeline (Auth Required)"])
+async def pipeline_check_unmapped(
+    perfume_id: Optional[str] = Query(default=None, description="Optional perfume UUID"),
+    current_user: Dict[str, Any] = Depends(verify_admin),
+):
+    """List accord/note raw texts not present in note_aliases."""
+    try:
+        result = await asyncio.to_thread(check_unmapped, perfume_id)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unmapped check failed: {str(e)}")
+
+
+@app.post("/pipeline/reviews/score", tags=["Pipeline (Auth Required)"])
+async def pipeline_score_reviews(
+    perfume_id: Optional[str] = Query(default=None),
+    limit: int = Query(default=DEFAULT_SCORE_LIMIT, ge=1, le=MAX_SCORE_LIMIT),
+    rescore: bool = Query(
+        default=False,
+        description="Delete existing LLM+lexicon scores for perfume_id, then re-score (requires perfume_id)",
+    ),
+    current_user: Dict[str, Any] = Depends(verify_admin),
+):
+    """
+    Score unscored reviews via OmniRoute LLM (8 axes/gates) and NRC-VAD lexicon
+    (valence + dominance when matched_words >= threshold).
+    With rescore=true + perfume_id: wipe that perfume's llm+lexicon scores first.
+    """
+    if rescore and not perfume_id:
+        raise HTTPException(
+            status_code=400,
+            detail="rescore=true requires perfume_id (refuses global score wipe)",
+        )
+    try:
+        result = await asyncio.to_thread(
+            score_reviews,
+            perfume_id=perfume_id,
+            limit=limit,
+            rescore=rescore,
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Review scoring failed: {str(e)}")
+
+
+@app.post("/pipeline/reviews/score-lexicon", tags=["Pipeline (Auth Required)"])
+async def pipeline_score_lexicon(
+    perfume_id: Optional[str] = Query(default=None),
+    limit: int = Query(default=DEFAULT_SCORE_LIMIT, ge=1, le=MAX_SCORE_LIMIT),
+    current_user: Dict[str, Any] = Depends(verify_admin),
+):
+    """
+    Cheap backfill: add method=lexicon valence/dominance for reviews that already
+    have a full LLM score set. Does not call the LLM.
+    """
+    try:
+        result = await asyncio.to_thread(
+            backfill_lexicon_scores,
+            perfume_id=perfume_id,
+            limit=limit,
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lexicon backfill failed: {str(e)}")
+
+
+@app.post("/pipeline/opinions/score", tags=["Pipeline (Auth Required)"])
+async def pipeline_score_opinions(
+    perfume_id: str = Query(..., description="Perfume UUID (required)"),
+    rescore: bool = Query(
+        default=False,
+        description="Delete existing opinion scores for perfume, then re-score",
+    ),
+    current_user: Dict[str, Any] = Depends(verify_admin),
+):
+    """
+    Score Fragrantica pros/cons via LLM (+ lexicon for V/D).
+    Skips opinions with character_relevant=false (price, longevity, etc.).
+    Not included in run-all — call explicitly after scrape.
+    """
+    try:
+        result = await asyncio.to_thread(
+            score_opinions,
+            perfume_id=perfume_id,
+            rescore=rescore,
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Opinion scoring failed: {str(e)}")
+
+
+@app.post("/pipeline/moods/compute", tags=["Pipeline (Auth Required)"])
+async def pipeline_compute_moods(
+    perfume_id: Optional[str] = Query(default=None),
+    current_user: Dict[str, Any] = Depends(verify_admin),
+):
+    """Blend note priors + review posteriors, apply quality_gates, upsert perfume_mood_scores."""
+    try:
+        result = await asyncio.to_thread(compute_moods, perfume_id)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Mood compute failed: {str(e)}")
+
+
+@app.post("/pipeline/run-all", tags=["Pipeline (Auth Required)"])
+async def pipeline_run_all(
+    perfume_id: Optional[str] = Query(default=None),
+    force: bool = Query(default=False, description="Continue even if unmapped notes exist"),
+    rescore: bool = Query(
+        default=False,
+        description="Wipe LLM scores for perfume_id then re-score (requires perfume_id)",
+    ),
+    score_limit: int = Query(default=DEFAULT_SCORE_LIMIT, ge=1, le=MAX_SCORE_LIMIT),
+    current_user: Dict[str, Any] = Depends(verify_admin),
+):
+    """Orchestrator: check-unmapped → score → compute."""
+    if rescore and not perfume_id:
+        raise HTTPException(
+            status_code=400,
+            detail="rescore=true requires perfume_id (refuses global score wipe)",
+        )
+
+    notes_result = await asyncio.to_thread(check_unmapped, perfume_id)
+    if notes_result.get("count", 0) > 0 and not force:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Unmapped note/accord texts found; fix note_aliases or pass force=true",
+                "unmapped": notes_result.get("unmapped"),
+                "count": notes_result.get("count"),
+            },
+        )
+
+    try:
+        score_result = await asyncio.to_thread(
+            score_reviews,
+            perfume_id=perfume_id,
+            limit=score_limit,
+            rescore=rescore,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    mood_result = await asyncio.to_thread(compute_moods, perfume_id)
+    return {
+        "status": "success",
+        "force": force,
+        "rescore": rescore,
+        "notes": notes_result,
+        "score": score_result,
+        "moods": mood_result,
     }
 
 
