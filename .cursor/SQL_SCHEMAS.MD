@@ -267,6 +267,24 @@ create table perfume_opinion_scores (
 
 create index perfume_opinion_scores_perfume_idx on perfume_opinion_scores (perfume_id);
 
+-- AI overview (display cache — NOT mood scoring). One row per perfume; upsert on regenerate.
+create table perfume_ai_overviews (
+    id                   uuid primary key default gen_random_uuid(),
+    perfume_id           uuid not null references perfumes(id) on delete cascade,
+    summary              text not null,
+    pros                 jsonb not null,   -- 3–5 short chip phrases
+    cons                 jsonb not null,
+    pros_list            jsonb not null,   -- 6–10 one-sentence detail items
+    cons_list            jsonb not null,
+    model                text not null,
+    input_review_count   integer not null,
+    input_opinion_count  integer not null,
+    generated_at         timestamptz not null default now(),
+    unique (perfume_id)
+);
+
+create index perfume_ai_overviews_perfume_idx on perfume_ai_overviews (perfume_id);
+
 
 -- =====================================================================
 -- 5) TİCARİ / AFFILIATE

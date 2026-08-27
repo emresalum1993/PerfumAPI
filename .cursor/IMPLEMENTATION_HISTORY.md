@@ -4,6 +4,23 @@ Kronolojik kısa özetler. Agent her anlamlı değişiklikten sonra buraya 2–5
 
 ---
 
+## 2026-08-26 — AI overview + process README
+
+- Migration `008` `perfume_ai_overviews` (summary, pros/cons chips, pros_list/cons_list).
+- `pipeline/ai_overview.py` + `llm_client.generate_ai_overview`; stratified review sample; verbatim validation.
+- API: `POST /pipeline/ai-overview/generate`, `GET /perfumes/{id}/ai-overview` (no LLM on GET).
+- Docs: `PROCESS.md`, `.cursor/CURSOR_PROMPT_ai_overview.md`, AGENTS/SQL history.
+
+---
+
+## 2026-08-26 — moods/compute “stale scores” clarified (no short-circuit)
+
+- Audited `compute_moods`: always full recompute + upsert; no review-count skip.
+- 47.04→47.75 on lexicon-check was a **reporting** fix (old check was reviews-only); compute already used ~47.75 → moods correctly unchanged at 44.53 etc.
+- `moods/compute?perfume_id=` now returns `details[]` with `final_axes` / moods for verification.
+
+---
+
 ## 2026-08-26 — Fix lexicon-check divergence + V/D weighting clarity
 
 - `lexicon_check`: remove nested per-axis `divergence`; one top-level `divergence` from `_review_posteriors` (weighted reviews+opinions).

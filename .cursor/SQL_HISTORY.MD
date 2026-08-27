@@ -119,9 +119,21 @@ Not: RLS policy’leri dosyada yorum satırı; production’da ayrıca açılmad
 
 ---
 
+## 008 — `008_create_perfume_ai_overviews.sql`
+
+| | |
+|---|---|
+| **Durum** | Yeni — SQL Editor’de çalıştır (AI overview öncesi) |
+| **Ne yaptı** | `perfume_ai_overviews` — summary + pros/cons + pros_list/cons_list |
+| **Neden** | Orijinal LLM sentezi (mood skorlarından ayrı display cache) |
+| **Bağımlılık** | `perfumes` |
+| **Şema eşlemesi** | `SQL_SCHEMAS.MD` (AI overview; mood katmanı değil) |
+
+---
+
 ## Henüz migration dosyası olmayan şema (SQL_SCHEMAS.MD v0.3 — 1–6)
 
-**Durum (2026-08-26):** Üst katman 1 / 1b / 2 / 4 tabloları + seed DB’de. Katman 3 (`emotion_lexicon`) NRC-VAD ile dolu. `007` opinion skor tablosu.
+**Durum (2026-08-26):** Üst katman 1 / 1b / 2 / 4 tabloları + seed DB’de. Katman 3 (`emotion_lexicon`) NRC-VAD ile dolu. `007` opinion skor tablosu. `008` AI overview.
 
 | Katman | Tablolar | Ne zaman migrate edilir | v0.3 notu |
 |--------|----------|-------------------------|-----------|
@@ -130,6 +142,7 @@ Not: RLS policy’leri dosyada yorum satırı; production’da ayrıca açılmad
 | 2 Nota taksonomisi | `note_categories`, `note_aliases`, `note_category_axis_weights` | Wheel / mapping | **30** Fragrantica wheel kategorisi + seed |
 | 3 Sözlük | `emotion_lexicon` | Lexicon yöntemi | NRC-VAD unigrams; `006` numeric widen |
 | 4 Skor | `perfume_mood_scores`, `review_axis_scores`, `perfume_opinion_scores` | Batch skor job | `method` ∈ llm, lexicon |
+| — | `perfume_ai_overviews` | AI overview generate | Display cache; mood değil |
 | 5 Ticari | `retailers`, `purchase_links`, `link_clicks` | Affiliate | — |
 | 6 Uygulama | `user_selections`, `user_mood_selections` | Kullanıcı seçimleri | — |
 
@@ -145,4 +158,5 @@ Not: RLS policy’leri dosyada yorum satırı; production’da ayrıca açılmad
 005  reviews.content_text pg_trgm GIN
 006  emotion_lexicon numeric(5,2) widen (opsiyonel)
 007  perfume_opinion_scores
+008  perfume_ai_overviews
 ```

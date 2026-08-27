@@ -44,8 +44,11 @@ from pipeline import (
     backfill_lexicon_scores,
     lexicon_check,
     score_opinions,
+    generate_overview,
+    get_ai_overview,
 )
 from pipeline.constants import DEFAULT_SCORE_LIMIT, MAX_SCORE_LIMIT
+from pipeline.llm_client import LLMUnavailableError
 
 
 # Load environment variables
@@ -261,6 +264,8 @@ async def root():
             "pipeline_score_lexicon": "/pipeline/reviews/score-lexicon (auth)",
             "pipeline_opinions": "/pipeline/opinions/score (auth)",
             "pipeline_moods": "/pipeline/moods/compute (auth)",
+            "pipeline_ai_overview": "/pipeline/ai-overview/generate (auth)",
+            "perfume_ai_overview": "/perfumes/{id}/ai-overview",
             "pipeline_run_all": "/pipeline/run-all (auth)",
         }
     }
@@ -957,6 +962,49 @@ async def pipeline_compute_moods(
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Mood compute failed: {str(e)}")
+
+
+@app.get("/perfumes/{perfume_id}/ai-overview", tags=["Perfumes"])
+async def perfume_ai_overview(perfume_id: str):
+    """
+    Public cached AI overview. Never triggers LLM generation.
+    Returns {"generated": false} when no row exists.
+    """
+    perfume = await get_perfume_by_id(perfume_id)
+    if not perfume:
+        raise HTTPException(status_code=404, detail=f"Perfume with ID {perfume_id} not found")
+    try:
+        return await asyncio.to_thread(get_ai_overview, perfume_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching AI overview: {str(e)}")
+
+
+@app.post("/pipeline/ai-overview/generate", tags=["Pipeline (Auth Required)"])
+async def pipeline_generate_ai_overview(
+    perfume_id: str = Query(..., description="Perfume UUID (required)"),
+    force: bool = Query(
+        default=False,
+        description="Regenerate even if a row already exists (costs an LLM call)",
+    ),
+    current_user: Dict[str, Any] = Depends(verify_admin),
+):
+    """
+    Generate original summary + pros/cons chips + fuller pros_list/cons_list.
+    Skips LLM when a row exists and force=false. Not included in run-all.
+    """
+    perfume = await get_perfume_by_id(perfume_id)
+    if not perfume:
+        raise HTTPException(status_code=404, detail=f"Perfume with ID {perfume_id} not found")
+    try:
+        return await asyncio.to_thread(generate_overview, perfume_id, force=force)
+    except ValueError as e:
+        msg = str(e)
+        code = 422 if msg.startswith("insufficient_data") else 400
+        raise HTTPException(status_code=code, detail=msg)
+    except LLMUnavailableError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"AI overview generate failed: {str(e)}")
 
 
 @app.post("/pipeline/run-all", tags=["Pipeline (Auth Required)"])

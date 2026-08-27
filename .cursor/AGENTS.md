@@ -9,6 +9,8 @@ Bu dosya, projede çalışan agent’lar için kalıcı bağlamdır.
 | [`IMPLEMENTATION_HISTORY.md`](./IMPLEMENTATION_HISTORY.md) | Yapılan işlerin kısa kronolojisi — **agent nerede kaldığını buradan okur** |
 | [`AUTOMATION_IMPLEMENTATION.MD`](./AUTOMATION_IMPLEMENTATION.MD) | Mood pipeline endpoint tasarımı |
 | [`MOOD_SCORING.md`](./MOOD_SCORING.md) | Mood scoring teknik özeti (prior → LLM → blend → labels) |
+| [`CURSOR_PROMPT_ai_overview.md`](./CURSOR_PROMPT_ai_overview.md) | AI overview (summary + chips + lists) |
+| [`../PROCESS.md`](../PROCESS.md) | Operatör rehberi: scrape → reviews → score → AI overview |
 | [`../migrations/`](../migrations/) | Incremental SQL (repo kökü) |
 
 Şema/migration değişince: `SQL_SCHEMAS.MD` + gerekirse migration + `SQL_HISTORY.MD` + **`IMPLEMENTATION_HISTORY.md` özeti**.
@@ -67,6 +69,7 @@ Scrape master + review satırları. Detay alanlar için `SQL_SCHEMAS.MD` §0.
 | 2 | `note_categories` (30), `note_aliases`, `note_category_axis_weights` | |
 | 3 | `emotion_lexicon` | NRC-VAD unigrams (0–100) |
 | 4 | `perfume_mood_scores`, `review_axis_scores`, `perfume_opinion_scores` | `method` ∈ llm, lexicon |
+| — | `perfume_ai_overviews` | Display cache; not mood scoring |
 
 Alias: scrape `warm spicy` → alias → kategori `warm_spicy`.
 
@@ -81,12 +84,16 @@ Alias: scrape `warm spicy` → alias → kategori `warm_spicy`.
 | `POST /pipeline/reviews/score-lexicon?perfume_id=&limit=` | Lexicon backfill only (no LLM) |
 | `POST /pipeline/opinions/score?perfume_id=&rescore=` | Pros/cons LLM+lexicon (character filter); not in run-all |
 | `POST /pipeline/moods/compute?perfume_id=` | Prior+posterior+gates → `perfume_mood_scores` |
+| `POST /pipeline/ai-overview/generate?perfume_id=&force=` | Original summary + pros/cons + lists; skip if exists unless force |
 | `POST /pipeline/run-all?force=&rescore=&score_limit=` | Orkestratör (unmapped → 409 unless force; rescore için perfume_id) |
 | `GET /perfumes/{id}/moods` | Public mood skorları |
 | `GET /perfumes/{id}/summary` | Public kompakt kart |
+| `GET /perfumes/{id}/ai-overview` | Public AI overview (`generated: false` if missing; no LLM) |
 | `GET /perfumes/{id}/lexicon-check` | LLM vs lexicon vs blended V/D |
 
-Env: `LLM_*`, `PIPELINE_*`, `LEXICON_*`, `REVIEW_HELPFULNESS_WEIGHT_CAP`, `PROS_CONS_WEIGHT_CAP`, `LEXICON_MIN_MATCHED_WORDS_OPINIONS` — `env.example`.
+Env: `LLM_*`, `PIPELINE_*`, `LEXICON_*`, `REVIEW_HELPFULNESS_WEIGHT_CAP`, `PROS_CONS_WEIGHT_CAP`, `LEXICON_MIN_MATCHED_WORDS_OPINIONS`, `AI_OVERVIEW_*` — `env.example`.
+
+Operatör akışı: [`PROCESS.md`](../PROCESS.md).
 
 ---
 
@@ -106,6 +113,6 @@ Env: `LLM_*`, `PIPELINE_*`, `LEXICON_*`, `REVIEW_HELPFULNESS_WEIGHT_CAP`, `PROS_
 
 | Endpoint | Auth |
 |----------|------|
-| `GET /perfumes`, `GET /perfumes/{id}`, `GET /perfumes/{id}/reviews`, `GET /perfumes/{id}/moods`, `GET /perfumes/{id}/summary`, `GET /perfumes/{id}/lexicon-check` | Hayır |
+| `GET /perfumes`, `GET /perfumes/{id}`, `GET /perfumes/{id}/reviews`, `GET /perfumes/{id}/moods`, `GET /perfumes/{id}/summary`, `GET /perfumes/{id}/lexicon-check`, `GET /perfumes/{id}/ai-overview` | Hayır |
 | `POST /scrape/*`, `POST /scrape/reviews/{id}` | Evet |
 | `POST /pipeline/*` | Evet |

@@ -1,6 +1,12 @@
 # Perfume Data API
 
-A complete FastAPI application that scrapes perfume data from Fragrantica, stores it in Supabase (PostgreSQL), and serves it through a REST API. Currently being hosted here https://perfumapi-frontend.onrender.com/. For testing and educational purposes. One love Fragrantica.com <3. Made by the one and only SECCAZ.
+A FastAPI app that scrapes Fragrantica, stores data in Supabase, scores moods, and serves REST endpoints.
+
+**End-to-end operator guide (scrape → reviews → score → AI overview):** see [`PROCESS.md`](./PROCESS.md).
+
+Agent / schema docs live under [`.cursor/`](./.cursor/) (`AGENTS.md`, `MOOD_SCORING.md`, `SQL_SCHEMAS.MD`).
+
+---
 
 ## Features
 
@@ -9,6 +15,9 @@ A complete FastAPI application that scrapes perfume data from Fragrantica, store
   - Brand-specific scraping (e.g., Jean Paul Gaultier, Xerjoff, Creed)
   - Multi-brand batch scraping
   - Direct URL scraping (fastest - single perfume)
+  - Review scrape by perfume UUID (`positive` / `negative`)
+- **Mood pipeline**: LLM + NRC-VAD lexicon → `perfume_mood_scores`
+- **AI overview**: original summary + pros/cons chips + detail lists (`perfume_ai_overviews`)
 - **Supabase Integration**: PostgreSQL database with auto-migration
 - **Authentication**: Supabase JWT-based auth for protected endpoints
 - **FastAPI Backend**: Fast, modern REST API with automatic documentation

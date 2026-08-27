@@ -432,6 +432,7 @@ def compute_moods(perfume_id: Optional[str] = None) -> Dict[str, Any]:
 
     updated = 0
     gated_out_count = 0
+    details: List[Dict[str, Any]] = []
     now = datetime.now(timezone.utc).isoformat()
 
     for perfume in perfumes:
@@ -471,12 +472,27 @@ def compute_moods(perfume_id: Optional[str] = None) -> Dict[str, Any]:
             on_conflict="perfume_id,mood_key",
         ).execute()
         updated += 1
+        if perfume_id:
+            details.append(
+                {
+                    "perfume_id": perfume["id"],
+                    "sample_size": review_count,
+                    "confidence": conf,
+                    "gated_out": gated_out,
+                    "posterior_axes": {k: round(v, 4) for k, v in posterior.items()},
+                    "final_axes": {k: round(v, 4) for k, v in blended.items()},
+                    "gates": {k: round(v, 4) for k, v in gates.items()},
+                    "divergence": {k: round(v, 4) for k, v in divergence.items()},
+                    "moods": moods,
+                }
+            )
 
     return {
         "status": "success",
         "message": f"Updated mood scores for {updated} perfume(s)",
         "updated_perfumes": updated,
         "gated_out_count": gated_out_count,
+        "details": details,
     }
 
 

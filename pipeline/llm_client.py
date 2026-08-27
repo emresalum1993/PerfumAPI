@@ -8,7 +8,13 @@ from typing import Any, Dict, Optional
 
 from openai import OpenAI
 
-from pipeline.constants import ALL_SCORE_KEYS, LLM_API_KEY, LLM_BASE_URL, LLM_MODEL
+from pipeline.constants import (
+    AI_OVERVIEW_TEMPERATURE,
+    ALL_SCORE_KEYS,
+    LLM_API_KEY,
+    LLM_BASE_URL,
+    LLM_MODEL,
+)
 
 
 class LLMUnavailableError(RuntimeError):
@@ -59,14 +65,19 @@ def _normalize_scores(raw: Dict[str, Any]) -> Dict[str, float]:
     return out
 
 
-def _chat_json(system: str, user: str) -> Dict[str, Any]:
+def _chat_json(
+    system: str,
+    user: str,
+    *,
+    temperature: float = 0.2,
+) -> Dict[str, Any]:
     client = get_client()
     last_err: Optional[Exception] = None
     for _ in range(2):
         try:
             resp = client.chat.completions.create(
                 model=LLM_MODEL,
-                temperature=0.2,
+                temperature=temperature,
                 messages=[
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
@@ -80,7 +91,7 @@ def _chat_json(system: str, user: str) -> Dict[str, Any]:
             try:
                 resp = client.chat.completions.create(
                     model=LLM_MODEL,
-                    temperature=0.2,
+                    temperature=temperature,
                     messages=[
                         {"role": "system", "content": system},
                         {"role": "user", "content": user},
@@ -187,3 +198,56 @@ def score_opinion_text(
     scores = _normalize_scores(raw)
     scores["character_relevant"] = relevant
     return scores
+
+
+def generate_ai_overview(
+    *,
+    perfume_name: str,
+    brand: Optional[str],
+    opinions_block: str,
+    reviews_block: str,
+    polarizing: bool = False,
+) -> Dict[str, Any]:
+    """
+    One LLM call → original summary + pros/cons chips + fuller pros_list/cons_list.
+    Caller validates lengths and verbatim copying.
+    """
+    if not is_llm_configured():
+        raise LLMUnavailableError("LLM_BASE_URL is not set")
+
+    polarizing_line = (
+        "Reviews/opinions show a polarizing or divisive scent reaction — "
+        "the summary MUST reflect that people are split, not a falsely uniform picture.\n"
+        if polarizing
+        else ""
+    )
+
+    system = (
+        "Write an original summary and pros/cons for this perfume, based only "
+        "on the reviews and opinions provided below. Do not copy phrases "
+        "verbatim from the source material — paraphrase and synthesize in your "
+        "own words. Do not state anything not supported by the provided text.\n"
+        f"{polarizing_line}"
+        "Return JSON only with these keys:\n"
+        "{\n"
+        '  "summary": "2-4 sentences, neutral tone, covering both what people '
+        'love and what divides opinion if the reviews are mixed",\n'
+        '  "pros": ["3-5 short original phrases — quick highlights"],\n'
+        '  "cons": ["3-5 short original phrases — quick highlights"],\n'
+        '  "pros_list": ["6-10 items, each ONE short original sentence — a '
+        "fuller list than 'pros', for a detail view\"],\n"
+        '  "cons_list": ["6-10 items, each ONE short original sentence — a '
+        "fuller list than 'cons', for a detail view\"]\n"
+        "}\n"
+        "pros_list/cons_list must expand pros/cons: every chip theme should "
+        "appear (possibly reworded) in the matching fuller list; add more "
+        "supported points with slightly fuller sentences — not unrelated extras.\n"
+        "No markdown, no commentary."
+    )
+    user = (
+        f"Perfume: {perfume_name}\n"
+        f"Brand: {brand or 'unknown'}\n\n"
+        f"Fragrantica opinions (pros/cons text only):\n{opinions_block}\n\n"
+        f"Selected reviews (stratified by sentiment):\n{reviews_block}"
+    )
+    return _chat_json(system, user, temperature=AI_OVERVIEW_TEMPERATURE)
