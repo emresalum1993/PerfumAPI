@@ -165,6 +165,62 @@ class ScrapeUrlRequest(BaseModel):
     perfume_url: str = Field(..., description="Direct URL to a Fragrantica perfume page (e.g., 'https://www.fragrantica.com/perfume/Xerjoff/White-On-White-Three-76333.html')")
 
 
+class FullProcessUrlRequest(BaseModel):
+    """Model for single-call end-to-end perfume processing by URL or auto limit"""
+    perfume_url: Optional[str] = Field(
+        default=None,
+        description="Direct Fragrantica URL (e.g., 'https://www.fragrantica.com/perfume/Maison-Francis-Kurkdjian/Baccarat-Rouge-540-33519.html')",
+    )
+    auto: bool = Field(
+        default=False,
+        description="If true, automatically discovers and processes popular perfumes using `limit` instead of `perfume_url`",
+    )
+    limit: int = Field(
+        default=10,
+        ge=1,
+        le=100,
+        description="Number of popular perfumes to scrape and process when auto=true",
+    )
+    review_pages: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+        description="Number of review pages to scrape per sentiment (positive & negative)",
+    )
+    force: bool = Field(
+        default=True,
+        description="Continue pipeline even if unmapped notes exist",
+    )
+    rescore: bool = Field(
+        default=False,
+        description="Wipe existing LLM scores for this perfume first",
+    )
+
+
+class FullProcessPopularRequest(BaseModel):
+    """Model for automatic bulk end-to-end perfume processing (no URL needed)"""
+    limit: int = Field(
+        default=5,
+        ge=1,
+        le=50,
+        description="Number of popular perfumes to discover and run through the end-to-end master pipeline",
+    )
+    review_pages: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+        description="Number of review pages to scrape per sentiment (positive & negative)",
+    )
+    force: bool = Field(
+        default=True,
+        description="Continue pipeline even if unmapped notes exist",
+    )
+    rescore: bool = Field(
+        default=False,
+        description="Wipe existing LLM scores for this perfume first",
+    )
+
+
 class ScrapeResponse(BaseModel):
     """Model for scrape response"""
     status: str
@@ -267,6 +323,7 @@ async def root():
             "pipeline_ai_overview": "/pipeline/ai-overview/generate (auth)",
             "perfume_ai_overview": "/perfumes/{id}/ai-overview",
             "pipeline_run_all": "/pipeline/run-all (auth)",
+            "pipeline_process_url": "/pipeline/process-url (auth)",
         }
     }
 
@@ -1054,6 +1111,294 @@ async def pipeline_run_all(
         "notes": notes_result,
         "score": score_result,
         "moods": mood_result,
+    }
+
+
+async def _execute_master_pipeline(
+    perfume_url: str,
+    review_pages: int = 5,
+    force: bool = True,
+    rescore: bool = False,
+):
+    perfume_url = perfume_url.strip()
+    if not perfume_url or "fragrantica.com/perfume/" not in perfume_url:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid Fragrantica perfume URL: {perfume_url}",
+        )
+
+    # Step 1: Scrape Perfume
+    print(f"\n==================================================", flush=True)
+    print(f"🔍 [1/5] Scraping perfume details for: '{perfume_url}'...", flush=True)
+    scraped_perfume = await asyncio.to_thread(scrape_fragrantica_by_url, perfume_url)
+    if not scraped_perfume:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to scrape perfume from URL: {perfume_url}",
+        )
+
+    await insert_perfumes_batch([scraped_perfume])
+
+    # Fetch inserted perfume row to get UUID
+    perfume_resp = (
+        supabase.table("perfumes")
+        .select("*")
+        .eq("perfume_url", perfume_url)
+        .limit(1)
+        .execute()
+    )
+    if not perfume_resp.data:
+        raise HTTPException(status_code=500, detail="Failed to retrieve perfume UUID after insert")
+
+    perfume = perfume_resp.data[0]
+    perfume_id = perfume["id"]
+    fragrantica_id = perfume.get("fragrantica_id")
+    print(f"✅ [1/5] Perfume Scraped & Saved: '{perfume.get('name')}' by '{perfume.get('brand')}' (ID: {perfume_id})", flush=True)
+
+    # Step 2: Scrape Reviews (Positive & Negative)
+    reviews_scraped_count = 0
+    if fragrantica_id:
+        print(f"📝 [2/5] Scraping reviews (positive & negative pages)...", flush=True)
+        for sentiment in ("positive", "negative"):
+            max_sentiment_retries = 3
+            sentiment_success = False
+            for sentiment_attempt in range(1, max_sentiment_retries + 1):
+                try:
+                    res = await asyncio.to_thread(
+                        scrape_fragrantica_reviews,
+                        perfume_uuid=perfume_id,
+                        fragrantica_id=int(fragrantica_id),
+                        perfume_url=perfume_url,
+                        sentiment=sentiment,
+                        pages=review_pages,
+                    )
+                    reviews = res.get("reviews") or []
+                    inserted = await upsert_reviews(reviews)
+                    reviews_scraped_count += inserted
+                    print(f"   -> Scraped {len(reviews)} {sentiment} reviews (inserted/updated: {inserted})", flush=True)
+                    sentiment_success = True
+                    break
+                except Exception as e:
+                    print(f"   ⚠️ [Attempt {sentiment_attempt}/{max_sentiment_retries}] Review scraping ({sentiment}) failed: {e}", flush=True)
+                    if sentiment_attempt < max_sentiment_retries:
+                        print(f"   🔄 Retrying {sentiment} review scrape in {5 * sentiment_attempt}s...", flush=True)
+                        await asyncio.sleep(5 * sentiment_attempt)
+
+            if not sentiment_success:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Failed to scrape {sentiment} reviews for perfume after {max_sentiment_retries} attempts",
+                )
+        print(f"✅ [2/5] Finished reviews scrape. Total new reviews added: {reviews_scraped_count}", flush=True)
+
+    # Step 3: Check notes & Score Reviews (Batched LLM)
+    print(f"🧠 [3/5] Scoring reviews with batched LLM & checking unmapped notes...", flush=True)
+    notes_result = await asyncio.to_thread(check_unmapped, perfume_id)
+    if notes_result.get("count", 0) > 0 and not force:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Unmapped notes found; pass force=true to proceed",
+                "unmapped": notes_result.get("unmapped"),
+            },
+        )
+
+    score_result = await asyncio.to_thread(
+        score_reviews,
+        perfume_id=perfume_id,
+        limit=MAX_SCORE_LIMIT,
+        rescore=rescore,
+    )
+    print(f"✅ [3/5] Review scoring finished: {score_result.get('scored')} reviews scored via LLM, {score_result.get('lexicon_written')} lexicon scores persisted.", flush=True)
+
+    # Step 4: Score Opinions (Pros/Cons Batched LLM) & Compute Moods
+    print(f"📊 [4/5] Scoring pros/cons opinions & computing mood scores...", flush=True)
+    opinion_result = await asyncio.to_thread(
+        score_opinions,
+        perfume_id=perfume_id,
+        rescore=rescore,
+    )
+    mood_result = await asyncio.to_thread(compute_moods, perfume_id)
+    print(f"✅ [4/5] Mood computation finished: {opinion_result.get('scored')} opinions scored, updated {mood_result.get('updated_perfumes')} perfume mood scores.", flush=True)
+
+    # Step 5: Generate AI Overview
+    print(f"✨ [5/5] Synthesizing AI Overview (summary + pros/cons chips)...", flush=True)
+    ai_overview_result = None
+    try:
+        ai_overview_result = await asyncio.to_thread(
+            generate_overview,
+            perfume_id,
+            force=force,
+        )
+        print(f"✅ [5/5] AI Overview synthesis complete!", flush=True)
+    except Exception as e:
+        ai_overview_result = {"warning": f"AI overview generation skipped: {str(e)}"}
+        print(f"⚠️ [5/5] AI Overview skipped: {e}", flush=True)
+
+    print(f"🎉 MASTER PIPELINE COMPLETED SUCCESSFULLY FOR '{perfume.get('name')}'!", flush=True)
+    print(f"==================================================\n", flush=True)
+
+    return {
+        "status": "success",
+        "perfume_id": perfume_id,
+        "perfume": perfume,
+        "reviews_scraped": reviews_scraped_count,
+        "notes": notes_result,
+        "review_scores": score_result,
+        "opinion_scores": opinion_result,
+        "moods": mood_result,
+        "ai_overview": ai_overview_result,
+    }
+
+
+@app.post("/pipeline/process-url", tags=["Pipeline (Auth Required)"])
+async def pipeline_process_url(
+    request: FullProcessUrlRequest,
+    current_user: Dict[str, Any] = Depends(verify_admin),
+):
+    """
+    End-to-End Master Pipeline for perfume processing.
+
+    Modes:
+    1. Single URL Mode: Pass `perfume_url` (e.g. `{"perfume_url": "https://...", "review_pages": 5, "force": true}`)
+    2. Auto Limit Mode: Pass `auto: true` and `limit` (e.g. `{"auto": true, "limit": 10, "review_pages": 5, "force": true}`)
+
+    In ONE request, this endpoint will run all 5 steps for the perfume(s):
+    1. Scrape perfume details (notes, accords, pros/cons)
+    2. Scrape reviews (positive AND negative pages)
+    3. Run note checking & batched review scoring
+    4. Run character-relevant opinion scoring (pros/cons)
+    5. Compute deterministic mood scores
+    6. Generate AI overview summary & pros/cons lists
+    """
+    # Check if auto mode is requested or perfume_url is omitted
+    if request.auto or not request.perfume_url:
+        from scraper.scrape import FragranticaScraper
+
+        limit = request.limit or 10
+        print(f"\n🚀 [AUTOMATIC BULK PIPELINE] Discovering top {limit} popular perfumes from Fragrantica...", flush=True)
+
+        scraper = FragranticaScraper(delay=17.0)
+        urls = await asyncio.to_thread(scraper.get_popular_perfumes_urls, limit=limit)
+
+        if not urls:
+            return {
+                "status": "warning",
+                "message": "No perfume URLs found from Fragrantica search",
+                "processed_count": 0,
+                "results": [],
+            }
+
+        print(f"Found {len(urls)} popular perfume URLs to process. Beginning sequential master pipeline...\n", flush=True)
+
+        results = []
+        for idx, url in enumerate(urls, 1):
+            print(f"▶️ Processing perfume [{idx}/{len(urls)}]: {url}", flush=True)
+            try:
+                res = await _execute_master_pipeline(
+                    perfume_url=url,
+                    review_pages=request.review_pages,
+                    force=request.force,
+                    rescore=request.rescore,
+                )
+                results.append({
+                    "url": url,
+                    "status": "success",
+                    "perfume_id": res.get("perfume_id"),
+                    "perfume_name": res.get("perfume", {}).get("name"),
+                })
+            except Exception as e:
+                print(f"❌ Failed processing {url}: {e}", flush=True)
+                results.append({
+                    "url": url,
+                    "status": "error",
+                    "error": str(e),
+                })
+
+        return {
+            "status": "success",
+            "mode": "auto",
+            "requested_limit": limit,
+            "found_urls": len(urls),
+            "successful_count": sum(1 for r in results if r["status"] == "success"),
+            "results": results,
+        }
+
+    # Otherwise, Single URL Mode
+    perfume_url = request.perfume_url.strip()
+    if not perfume_url or "fragrantica.com/perfume/" not in perfume_url:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid Fragrantica perfume URL: {perfume_url}",
+        )
+
+    return await _execute_master_pipeline(
+        perfume_url=perfume_url,
+        review_pages=request.review_pages,
+        force=request.force,
+        rescore=request.rescore,
+    )
+
+
+@app.post("/pipeline/process-popular", tags=["Pipeline (Auth Required)"])
+async def pipeline_process_popular(
+    request: FullProcessPopularRequest,
+    current_user: Dict[str, Any] = Depends(verify_admin),
+):
+    """
+    Automatic End-to-End Master Pipeline for popular perfumes (NO URL NEEDED).
+
+    Discovers up to `limit` popular perfumes from Fragrantica automatically,
+    and runs the full 5-step Master Pipeline for each one sequentially!
+    """
+    from scraper.scrape import FragranticaScraper
+
+    limit = request.limit
+    print(f"\n🚀 [AUTOMATIC BULK PIPELINE] Discovering top {limit} popular perfumes from Fragrantica...", flush=True)
+
+    scraper = FragranticaScraper(delay=17.0)
+    urls = await asyncio.to_thread(scraper.get_popular_perfumes_urls, limit=limit)
+
+    if not urls:
+        return {
+            "status": "warning",
+            "message": "No perfume URLs found from Fragrantica search",
+            "processed_count": 0,
+            "results": [],
+        }
+
+    print(f"Found {len(urls)} popular perfume URLs to process. Beginning sequential master pipeline...\n", flush=True)
+
+    results = []
+    for idx, url in enumerate(urls, 1):
+        print(f"▶️ Processing perfume [{idx}/{len(urls)}]: {url}", flush=True)
+        try:
+            res = await _execute_master_pipeline(
+                perfume_url=url,
+                review_pages=request.review_pages,
+                force=request.force,
+                rescore=request.rescore,
+            )
+            results.append({
+                "url": url,
+                "status": "success",
+                "perfume_id": res.get("perfume_id"),
+                "perfume_name": res.get("perfume", {}).get("name"),
+            })
+        except Exception as e:
+            print(f"❌ Failed processing {url}: {e}", flush=True)
+            results.append({
+                "url": url,
+                "status": "error",
+                "error": str(e),
+            })
+
+    return {
+        "status": "success",
+        "requested_limit": limit,
+        "found_urls": len(urls),
+        "successful_count": sum(1 for r in results if r["status"] == "success"),
+        "results": results,
     }
 
 

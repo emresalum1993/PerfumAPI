@@ -13,7 +13,12 @@ from pipeline.constants import (
     MOOD_AXES,
 )
 from pipeline.lexicon_scorer import score_review_lexicon
-from pipeline.llm_client import LLMUnavailableError, is_llm_configured, score_opinion_text
+from pipeline.llm_client import (
+    LLMUnavailableError,
+    is_llm_configured,
+    score_opinion_text,
+    score_opinions_batch,
+)
 from utils.db import supabase
 
 
@@ -127,66 +132,75 @@ def score_opinions(
     lexicon_written = 0
     errors: List[Dict[str, str]] = []
 
-    for item in items:
+    to_score: List[Dict[str, Any]] = []
+    for idx, item in enumerate(items):
         text = item["opinion_text"]
         if text in already:
             skipped_already += 1
-            continue
+        else:
+            to_score.append({"id": str(idx), **item})
+
+    if to_score:
+        batch_results: Dict[str, Dict[str, Any]] = {}
         try:
-            result = score_opinion_text(
-                text,
-                opinion_type=item["opinion_type"],
+            batch_results = score_opinions_batch(
+                to_score,
                 axis_labels=axis_labels,
                 gate_labels=gate_labels,
             )
-            if not result.get("character_relevant"):
-                skipped_irrelevant += 1
-                continue
+        except LLMUnavailableError as exc:
+            errors.append({"error": str(exc)})
+        except Exception as exc:
+            errors.append({"error": str(exc)})
 
-            llm_rows = [
-                {
-                    "perfume_id": perfume_id,
-                    "opinion_type": item["opinion_type"],
-                    "opinion_text": text,
-                    "fragrantica_score": item["fragrantica_score"],
-                    "axis_key": key,
-                    "score": result[key],
-                    "method": "llm",
-                    "computed_at": now,
-                }
-                for key in ALL_SCORE_KEYS
-            ]
-            supabase.table("perfume_opinion_scores").upsert(
-                llm_rows,
-                on_conflict="perfume_id,opinion_text,axis_key,method",
-            ).execute()
-            scored += 1
+        for item in to_score:
+            item_id = item["id"]
+            text = item["opinion_text"]
+            if item_id in batch_results:
+                result = batch_results[item_id]
+                if not result.get("character_relevant"):
+                    skipped_irrelevant += 1
+                    continue
 
-            lex = score_review_lexicon(text)
-            if lex and int(lex["matched_words"]) >= LEXICON_MIN_MATCHED_WORDS_OPINIONS:
-                lex_rows = [
+                llm_rows = [
                     {
                         "perfume_id": perfume_id,
                         "opinion_type": item["opinion_type"],
                         "opinion_text": text,
                         "fragrantica_score": item["fragrantica_score"],
                         "axis_key": key,
-                        "score": round(float(lex[key]), 2),
-                        "method": "lexicon",
+                        "score": result[key],
+                        "method": "llm",
                         "computed_at": now,
                     }
-                    for key in LEXICON_BLEND_KEYS
+                    for key in ALL_SCORE_KEYS
                 ]
                 supabase.table("perfume_opinion_scores").upsert(
-                    lex_rows,
+                    llm_rows,
                     on_conflict="perfume_id,opinion_text,axis_key,method",
                 ).execute()
-                lexicon_written += 1
-        except LLMUnavailableError as exc:
-            errors.append({"opinion_text": text, "error": str(exc)})
-            break
-        except Exception as exc:
-            errors.append({"opinion_text": text, "error": str(exc)})
+                scored += 1
+
+                lex = score_review_lexicon(text)
+                if lex and int(lex["matched_words"]) >= LEXICON_MIN_MATCHED_WORDS_OPINIONS:
+                    lex_rows = [
+                        {
+                            "perfume_id": perfume_id,
+                            "opinion_type": item["opinion_type"],
+                            "opinion_text": text,
+                            "fragrantica_score": item["fragrantica_score"],
+                            "axis_key": key,
+                            "score": round(float(lex[key]), 2),
+                            "method": "lexicon",
+                            "computed_at": now,
+                        }
+                        for key in LEXICON_BLEND_KEYS
+                    ]
+                    supabase.table("perfume_opinion_scores").upsert(
+                        lex_rows,
+                        on_conflict="perfume_id,opinion_text,axis_key,method",
+                    ).execute()
+                    lexicon_written += 1
 
     return {
         "status": "success" if scored or skipped_irrelevant or not errors else "error",

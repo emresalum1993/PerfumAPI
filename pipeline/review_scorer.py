@@ -15,7 +15,12 @@ from pipeline.constants import (
     MOOD_AXES,
 )
 from pipeline.lexicon_scorer import score_review_lexicon
-from pipeline.llm_client import LLMUnavailableError, is_llm_configured, score_review_text
+from pipeline.llm_client import (
+    LLMUnavailableError,
+    is_llm_configured,
+    score_review_text,
+    score_reviews_batch,
+)
 from utils.db import supabase
 
 _DELETE_CHUNK = 100
@@ -231,47 +236,49 @@ def score_reviews(
     errors: List[Dict[str, str]] = []
     now = datetime.now(timezone.utc).isoformat()
 
-    for review in reviews:
-        llm_ok = False
+    batch_chunk_size = 25
+    for i in range(0, len(reviews), batch_chunk_size):
+        chunk = reviews[i : i + batch_chunk_size]
+        batch_scores: Dict[str, Dict[str, float]] = {}
         try:
-            scores = score_review_text(
-                review["content_text"],
-                sentiment=review.get("sentiment"),
+            batch_scores = score_reviews_batch(
+                chunk,
                 axis_labels=axis_labels,
                 gate_labels=gate_labels,
             )
-            rows = [
-                {
-                    "review_id": review["id"],
-                    "axis_key": key,
-                    "score": scores[key],
-                    "method": "llm",
-                    "computed_at": now,
-                }
-                for key in ALL_SCORE_KEYS
-            ]
-            supabase.table("review_axis_scores").upsert(
-                rows,
-                on_conflict="review_id,axis_key,method",
-            ).execute()
-            scored += 1
-            llm_ok = True
         except LLMUnavailableError as exc:
-            errors.append({"review_id": review["id"], "error": str(exc)})
-            # Still attempt lexicon for this review, then stop batch
-            matched = _persist_lexicon_scores(review["id"], review["content_text"], now)
-            if matched is not None and matched >= LEXICON_MIN_MATCHED_WORDS:
-                lexicon_written += 1
+            errors.append({"error": str(exc)})
+            for review in reviews[i:]:
+                matched = _persist_lexicon_scores(review["id"], review["content_text"], now)
+                if matched is not None and matched >= LEXICON_MIN_MATCHED_WORDS:
+                    lexicon_written += 1
             break
         except Exception as exc:
-            errors.append({"review_id": review["id"], "error": str(exc)})
+            errors.append({"error": str(exc)})
 
-        matched = _persist_lexicon_scores(review["id"], review["content_text"], now)
-        if matched is not None and matched >= LEXICON_MIN_MATCHED_WORDS:
-            lexicon_written += 1
-        elif not llm_ok:
-            # neither persisted usefully beyond error log
-            pass
+        for review in chunk:
+            rid = review["id"]
+            if rid in batch_scores:
+                scores = batch_scores[rid]
+                rows = [
+                    {
+                        "review_id": rid,
+                        "axis_key": key,
+                        "score": scores[key],
+                        "method": "llm",
+                        "computed_at": now,
+                    }
+                    for key in ALL_SCORE_KEYS
+                ]
+                supabase.table("review_axis_scores").upsert(
+                    rows,
+                    on_conflict="review_id,axis_key,method",
+                ).execute()
+                scored += 1
+
+            matched = _persist_lexicon_scores(rid, review["content_text"], now)
+            if matched is not None and matched >= LEXICON_MIN_MATCHED_WORDS:
+                lexicon_written += 1
 
     remaining = None
     try:

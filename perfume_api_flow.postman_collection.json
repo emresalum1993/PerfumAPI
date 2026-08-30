@@ -1,0 +1,398 @@
+{
+	"info": {
+		"_postman_id": "f82b14c3-e847-4921-9a72-b7e12c12a450",
+		"name": "Perfume API - End to End Flow",
+		"description": "Complete workflow for Perfume API:\n0. Master Single-Call: POST /pipeline/process-url (scrapes perfume + reviews + scores + moods + AI overview in ONE call!)\n1. Individual Steps for debugging/granular execution",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"variable": [
+		{
+			"key": "baseUrl",
+			"value": "http://localhost:9000",
+			"type": "string"
+		},
+		{
+			"key": "bearerToken",
+			"value": "PASTE_YOUR_SUPABASE_ACCESS_TOKEN_HERE",
+			"type": "string"
+		},
+		{
+			"key": "perfumeUrl",
+			"value": "https://www.fragrantica.com/perfume/Maison-Francis-Kurkdjian/Baccarat-Rouge-540-33519.html",
+			"type": "string"
+		},
+		{
+			"key": "perfumeId",
+			"value": "",
+			"type": "string"
+		}
+	],
+	"item": [
+		{
+			"name": "0. MASTER - Process Perfume by URL (All-In-One)",
+			"event": [
+				{
+					"listen": "test",
+					"script": {
+						"exec": [
+							"var jsonData = pm.response.json();",
+							"if (jsonData.perfume_id) {",
+							"    pm.collectionVariables.set('perfumeId', jsonData.perfume_id);",
+							"    console.log('Set perfumeId to: ' + jsonData.perfume_id);",
+							"}"
+						],
+						"type": "text/javascript"
+					}
+				}
+			],
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Authorization",
+						"value": "Bearer {{bearerToken}}",
+						"type": "text"
+					},
+					{
+						"key": "Content-Type",
+						"value": "application/json",
+						"type": "text"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"perfume_url\": \"{{perfumeUrl}}\",\n  \"review_pages\": 5,\n  \"force\": true\n}"
+				},
+				"url": {
+					"raw": "{{baseUrl}}/pipeline/process-url",
+					"host": [
+						"{{baseUrl}}"
+					],
+					"path": [
+						"pipeline",
+						"process-url"
+					]
+				},
+				"description": "MASTER ENDPOINT: In ONE single call, scrapes perfume details, scrapes reviews, batched LLM scores reviews & opinions, computes mood scores, and generates AI overview summary."
+			},
+			"response": []
+		},
+		{
+			"name": "0.1 MASTER - Process Popular Perfumes (Auto Mode)",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Authorization",
+						"value": "Bearer {{bearerToken}}",
+						"type": "text"
+					},
+					{
+						"key": "Content-Type",
+						"value": "application/json",
+						"type": "text"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"auto\": true,\n  \"limit\": 10,\n  \"review_pages\": 5,\n  \"force\": true\n}"
+				},
+				"url": {
+					"raw": "{{baseUrl}}/pipeline/process-url",
+					"host": [
+						"{{baseUrl}}"
+					],
+					"path": [
+						"pipeline",
+						"process-url"
+					]
+				},
+				"description": "AUTOMATIC BULK MASTER ENDPOINT: Pass 'auto': true and 'limit': 10 to automatically discover top popular perfumes from Fragrantica without needing any URL, and run the complete end-to-end master flow!"
+			},
+			"response": []
+		},
+		{
+			"name": "1. Scrape - Fetch Perfume by URL",
+			"event": [
+				{
+					"listen": "test",
+					"script": {
+						"exec": [
+							"var jsonData = pm.response.json();",
+							"if (jsonData.id) {",
+							"    pm.collectionVariables.set('perfumeId', jsonData.id);",
+							"    console.log('Set perfumeId to: ' + jsonData.id);",
+							"} else if (jsonData.perfume && jsonData.perfume.id) {",
+							"    pm.collectionVariables.set('perfumeId', jsonData.perfume.id);",
+							"    console.log('Set perfumeId to: ' + jsonData.perfume.id);",
+							"}"
+						],
+						"type": "text/javascript"
+					}
+				}
+			],
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Authorization",
+						"value": "Bearer {{bearerToken}}",
+						"type": "text"
+					},
+					{
+						"key": "Content-Type",
+						"value": "application/json",
+						"type": "text"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"perfume_url\": \"{{perfumeUrl}}\"\n}"
+				},
+				"url": {
+					"raw": "{{baseUrl}}/scrape/url",
+					"host": [
+						"{{baseUrl}}"
+					],
+					"path": [
+						"scrape",
+						"url"
+					]
+				},
+				"description": "Scrapes perfume metadata (notes, accords, pros/cons) by Fragrantica URL and saves to Supabase. Automatically sets {{perfumeId}} collection variable."
+			},
+			"response": []
+		},
+		{
+			"name": "2a. Scrape - Positive Reviews",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Authorization",
+						"value": "Bearer {{bearerToken}}",
+						"type": "text"
+					}
+				],
+				"url": {
+					"raw": "{{baseUrl}}/scrape/reviews/{{perfumeId}}?pages=5&sentiment=positive",
+					"host": [
+						"{{baseUrl}}"
+					],
+					"path": [
+						"scrape",
+						"reviews",
+						"{{perfumeId}}"
+					],
+					"query": [
+						{
+							"key": "pages",
+							"value": "5"
+						},
+						{
+							"key": "sentiment",
+							"value": "positive"
+						}
+					]
+				},
+				"description": "Scrapes positive reviews for the specified perfume."
+			},
+			"response": []
+		},
+		{
+			"name": "2b. Scrape - Negative Reviews",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Authorization",
+						"value": "Bearer {{bearerToken}}",
+						"type": "text"
+					}
+				],
+				"url": {
+					"raw": "{{baseUrl}}/scrape/reviews/{{perfumeId}}?pages=5&sentiment=negative",
+					"host": [
+						"{{baseUrl}}"
+					],
+					"path": [
+						"scrape",
+						"reviews",
+						"{{perfumeId}}"
+					],
+					"query": [
+						{
+							"key": "pages",
+							"value": "5"
+						},
+						{
+							"key": "sentiment",
+							"value": "negative"
+						}
+					]
+				},
+				"description": "Scrapes negative reviews for the specified perfume."
+			},
+			"response": []
+		},
+		{
+			"name": "3a. Pipeline - Run All Mood Scoring",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Authorization",
+						"value": "Bearer {{bearerToken}}",
+						"type": "text"
+					}
+				],
+				"url": {
+					"raw": "{{baseUrl}}/pipeline/run-all?perfume_id={{perfumeId}}&force=true",
+					"host": [
+						"{{baseUrl}}"
+					],
+					"path": [
+						"pipeline",
+						"run-all"
+					],
+					"query": [
+						{
+							"key": "perfume_id",
+							"value": "{{perfumeId}}"
+						},
+						{
+							"key": "force",
+							"value": "true"
+						}
+					]
+				},
+				"description": "One-shot orchestrator: scores unscored reviews (batched LLM call + lexicon) and calculates final mood scores."
+			},
+			"response": []
+		},
+		{
+			"name": "3b. Pipeline - Score Pros/Cons Opinions",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Authorization",
+						"value": "Bearer {{bearerToken}}",
+						"type": "text"
+					}
+				],
+				"url": {
+					"raw": "{{baseUrl}}/pipeline/opinions/score?perfume_id={{perfumeId}}",
+					"host": [
+						"{{baseUrl}}"
+					],
+					"path": [
+						"pipeline",
+						"opinions",
+						"score"
+					],
+					"query": [
+						{
+							"key": "perfume_id",
+							"value": "{{perfumeId}}"
+						}
+					]
+				},
+				"description": "Scores character-relevant pros/cons from Fragrantica into mood posterior blend."
+			},
+			"response": []
+		},
+		{
+			"name": "4. Pipeline - Generate AI Overview",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Authorization",
+						"value": "Bearer {{bearerToken}}",
+						"type": "text"
+					}
+				],
+				"url": {
+					"raw": "{{baseUrl}}/pipeline/ai-overview/generate?perfume_id={{perfumeId}}",
+					"host": [
+						"{{baseUrl}}"
+					],
+					"path": [
+						"pipeline",
+						"ai-overview",
+						"generate"
+					],
+					"query": [
+						{
+							"key": "perfume_id",
+							"value": "{{perfumeId}}"
+						}
+					]
+				},
+				"description": "Generates original synthesis, pros/cons chips, and detail lists using LLM."
+			},
+			"response": []
+		},
+		{
+			"name": "5a. Public - Get Mood Scores",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{baseUrl}}/perfumes/{{perfumeId}}/moods",
+					"host": [
+						"{{baseUrl}}"
+					],
+					"path": [
+						"perfumes",
+						"{{perfumeId}}",
+						"moods"
+					]
+				},
+				"description": "Public reading of calculated mood scores."
+			},
+			"response": []
+		},
+		{
+			"name": "5b. Public - Get Summary Card",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{baseUrl}}/perfumes/{{perfumeId}}/summary",
+					"host": [
+						"{{baseUrl}}"
+					],
+					"path": [
+						"perfumes",
+						"{{perfumeId}}",
+						"summary"
+					]
+				},
+				"description": "Public compact card: accords, top mood, confidence, sample size."
+			},
+			"response": []
+		},
+		{
+			"name": "5c. Public - Get AI Overview",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{baseUrl}}/perfumes/{{perfumeId}}/ai-overview",
+					"host": [
+						"{{baseUrl}}"
+					],
+					"path": [
+						"perfumes",
+						"{{perfumeId}}",
+						"ai-overview"
+					]
+				},
+				"description": "Public read of the stored AI overview summary and pros/cons."
+			},
+			"response": []
+		}
+	]
+}

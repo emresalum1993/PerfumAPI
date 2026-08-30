@@ -44,8 +44,8 @@ class FragranticaScraper:
             delay: Minimum delay between requests in seconds (default 17.0)
         """
         self.delay = delay
-        self.max_retries = 2  # Only retry once (2 total attempts)
-        self.retry_delay = 30  # Fixed retry delay for 429 errors
+        self.max_retries = 5  # Retry up to 5 times on 403/429/network errors
+        self.retry_delay = 15  # Base retry delay for errors
         self.request_count = 0  # Track requests for progressive slowdown
         self.last_url = None  # Track last URL for referer
         self.last_html = None  # Raw HTML of last successful page fetch
@@ -68,12 +68,16 @@ class FragranticaScraper:
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0',
             'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         ]
-        
+        self.base_url = "https://www.fragrantica.com"
+        self._reset_session()
+
+    def _reset_session(self):
+        """Create a fresh requests session with a random User-Agent."""
         self.session = requests.Session()
         self.session.headers.update({
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.9',
-            'Referer': 'https://www.fragrantica.com/',
+            'Referer': self.last_url or self.base_url,
             'DNT': '1',
             'Connection': 'keep-alive',
             'Upgrade-Insecure-Requests': '1',
@@ -82,91 +86,63 @@ class FragranticaScraper:
             'Sec-Fetch-Site': 'same-origin',
             'Cache-Control': 'max-age=0'
         })
-        self.base_url = "https://www.fragrantica.com"
     
     def _get_page(self, url: str) -> Optional[BeautifulSoup]:
         """
-        Fetch and parse a web page with retry logic for rate limiting.
-        
-        Args:
-            url: URL to fetch
-            
-        Returns:
-            BeautifulSoup object or None if failed
+        Fetch and parse a web page with robust retry logic for 403 / 429 rate limiting.
         """
-        for attempt in range(self.max_retries):
+        for attempt in range(1, self.max_retries + 1):
             try:
                 # Rotate User-Agent to appear like different users
                 self.session.headers['User-Agent'] = random.choice(self.user_agents)
-                
-                # Update referer to previous page (simulate natural browsing)
                 if self.last_url:
                     self.session.headers['Referer'] = self.last_url
                 else:
                     self.session.headers['Referer'] = self.base_url
                 
-                print(f"📡 Fetching: {url}")
-                response = self.session.get(url, timeout=15)
+                print(f"📡 Fetching: {url} (attempt {attempt}/{self.max_retries})")
+                response = self.session.get(url, timeout=20)
                 
-                # Handle rate limiting (429 Too Many Requests)
-                if response.status_code == 429:
-                    if attempt < self.max_retries - 1:
-                        print(f"⚠️  Rate limited (429). Waiting {self.retry_delay} seconds before retry {attempt + 1}/{self.max_retries}...")
-                        time.sleep(self.retry_delay)
-                        continue
-                    else:
-                        print(f"⚠️  Rate limited (429). Max retries reached, moving on...")
-                        return None
+                # Handle rate limiting or Cloudflare blocks (429 / 403)
+                if response.status_code in (403, 429):
+                    wait = min(45, 10 * attempt)
+                    print(f"⚠️  Received HTTP {response.status_code} for {url}. Resetting session & waiting {wait}s (attempt {attempt}/{self.max_retries})...")
+                    time.sleep(wait)
+                    self._reset_session()
+                    continue
                 
                 response.raise_for_status()
                 
                 # Update last URL for next referer
                 self.last_url = url
-                
-                # Increment request counter
                 self.request_count += 1
                 
-                # Random long pause every 5-10 requests (simulate human reading)
+                # Random pause every 5-10 requests
                 if self.request_count % random.randint(5, 10) == 0:
-                    reading_pause = random.uniform(30, 90)
-                    print(f"📖 Taking a reading break for {reading_pause:.1f} seconds (simulating human behavior)...")
+                    reading_pause = random.uniform(15, 30)
+                    print(f"📖 Reading pause for {reading_pause:.1f}s...")
                     time.sleep(reading_pause)
                 
-                # Progressive slowdown: add 2s delay every 20 requests
+                # Progressive slowdown
                 progressive_delay = (self.request_count // 20) * 2
-                
-                # Add random delay to appear more human-like (delay ± 30%)
                 base_delay = self.delay + progressive_delay
-                actual_delay = base_delay + random.uniform(-base_delay * 0.3, base_delay * 0.3)
-                actual_delay = max(10.0, actual_delay)  # Ensure minimum 10 seconds
+                actual_delay = max(5.0, base_delay + random.uniform(-base_delay * 0.3, base_delay * 0.3))
                 
-                if progressive_delay > 0:
-                    print(f"⏳ Waiting {actual_delay:.1f} seconds (base: {base_delay}s due to {self.request_count} requests)...")
-                else:
-                    print(f"⏳ Waiting {actual_delay:.1f} seconds...")
+                print(f"⏳ Waiting {actual_delay:.1f} seconds...")
                 time.sleep(actual_delay)
                 
-                # Use response.text to let requests handle encoding/decompression
                 self.last_html = response.text
                 return BeautifulSoup(response.text, 'html.parser')
                 
-            except requests.exceptions.HTTPError as e:
-                if response.status_code == 429 and attempt < self.max_retries - 1:
-                    # Already handled above, continue to next attempt
-                    continue
-                print(f"❌ HTTP Error fetching {url}: {str(e)}")
-                self.last_html = None
-                return None
             except Exception as e:
-                print(f"❌ Error fetching {url}: {str(e)}")
-                if attempt < self.max_retries - 1:
-                    print(f"🔄 Retrying in {self.delay} seconds...")
-                    time.sleep(self.delay)
-                    continue
-                self.last_html = None
-                return None
-        
-        print(f"❌ Failed to fetch {url} after {self.max_retries} attempts")
+                wait = min(45, 10 * attempt)
+                print(f"❌ Error fetching {url}: {e}. Resetting session & waiting {wait}s (attempt {attempt}/{self.max_retries})...")
+                time.sleep(wait)
+                self._reset_session()
+                
+        print(f"❌ Max retries ({self.max_retries}) reached for {url}")
+        self.last_html = None
+        return None
         self.last_html = None
         return None
     
@@ -1190,29 +1166,43 @@ class FragranticaScraper:
         return perfume_data
 
     def _post_reviews_ajax(self, form: Dict[str, str], referer: str) -> Optional[Dict[str, Any]]:
-        """POST reviews4perfume_v2 and decrypt the CryptoJS response."""
+        """POST reviews4perfume_v2 and decrypt the CryptoJS response with retry logic."""
         ts = int(time.time() * 1000)
         url = f"{self.base_url}/ajax.php?reviews4perfume_v2&{ts}"
-        self.session.headers["User-Agent"] = random.choice(self.user_agents)
-        self.session.headers["Referer"] = referer
-        self.session.headers["Origin"] = self.base_url
-        self.session.headers["Accept"] = "application/json, text/plain, */*"
-        self.session.headers["Content-Type"] = "application/x-www-form-urlencoded"
-        self.session.headers["Sec-Fetch-Dest"] = "empty"
-        self.session.headers["Sec-Fetch-Mode"] = "cors"
-        self.session.headers["Sec-Fetch-Site"] = "same-origin"
 
-        response = self.session.post(url, data=form, timeout=20)
-        if response.status_code == 429:
-            print(f"⚠️  Reviews rate limited (429). Waiting {self.retry_delay}s...")
-            time.sleep(self.retry_delay)
-            response = self.session.post(url, data=form, timeout=20)
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                self.session.headers["User-Agent"] = random.choice(self.user_agents)
+                self.session.headers["Referer"] = referer
+                self.session.headers["Origin"] = self.base_url
+                self.session.headers["Accept"] = "application/json, text/plain, */*"
+                self.session.headers["Content-Type"] = "application/x-www-form-urlencoded"
+                self.session.headers["Sec-Fetch-Dest"] = "empty"
+                self.session.headers["Sec-Fetch-Mode"] = "cors"
+                self.session.headers["Sec-Fetch-Site"] = "same-origin"
 
-        response.raise_for_status()
-        blob = response.json()
-        if not isinstance(blob, dict) or "ct" not in blob:
-            raise ValueError("Unexpected reviews response (not a CryptoJS blob)")
-        return decrypt_cryptojs_blob(blob)
+                response = self.session.post(url, data=form, timeout=20)
+                if response.status_code in (403, 429):
+                    wait = min(45, 10 * attempt)
+                    print(f"⚠️  Reviews AJAX returned status {response.status_code}. Resetting session & waiting {wait}s (attempt {attempt}/{self.max_retries})...")
+                    time.sleep(wait)
+                    self._reset_session()
+                    continue
+
+                response.raise_for_status()
+                blob = response.json()
+                if not isinstance(blob, dict) or "ct" not in blob:
+                    raise ValueError("Unexpected reviews response (not a CryptoJS blob)")
+                return decrypt_cryptojs_blob(blob)
+
+            except Exception as e:
+                wait = min(45, 10 * attempt)
+                print(f"❌ Error in reviews AJAX: {e}. Resetting session & retrying in {wait}s (attempt {attempt}/{self.max_retries})...")
+                time.sleep(wait)
+                self._reset_session()
+
+        print(f"❌ Max retries reached for reviews AJAX POST")
+        return None
 
     def scrape_reviews(
         self,

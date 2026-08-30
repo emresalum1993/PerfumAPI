@@ -33,22 +33,22 @@ def get_client() -> OpenAI:
     )
 
 
-def _extract_json_object(text: str) -> Dict[str, Any]:
+def _extract_json_object(text: str) -> Any:
     text = (text or "").strip()
     if not text:
         raise ValueError("Empty LLM response")
     try:
         data = json.loads(text)
-        if isinstance(data, dict):
+        if isinstance(data, (dict, list)):
             return data
     except json.JSONDecodeError:
         pass
-    match = re.search(r"\{[\s\S]*\}", text)
+    match = re.search(r"[\{\[][\s\S]*[\}\]]", text)
     if not match:
         raise ValueError("No JSON object in LLM response")
     data = json.loads(match.group(0))
-    if not isinstance(data, dict):
-        raise ValueError("LLM JSON is not an object")
+    if not isinstance(data, (dict, list)):
+        raise ValueError("LLM JSON is not an object or array")
     return data
 
 
@@ -119,6 +119,65 @@ def _rubric_lines(
     return "\n".join(lines)
 
 
+def score_reviews_batch(
+    items: List[Dict[str, Any]],
+    *,
+    axis_labels: Optional[Dict[str, str]] = None,
+    gate_labels: Optional[Dict[str, str]] = None,
+) -> Dict[str, Dict[str, float]]:
+    """
+    Score a batch of review items in a single LLM call.
+    Each item in `items` should have 'id', 'content_text', and optionally 'sentiment'.
+    Returns a dict mapping item id -> score dict (8 keys, each 0-100).
+    """
+    if not items:
+        return {}
+    if not is_llm_configured():
+        raise LLMUnavailableError("LLM_BASE_URL is not set")
+
+    axis_labels = axis_labels or {}
+    gate_labels = gate_labels or {}
+
+    system = (
+        "You score perfume review texts for fragrance emotion research.\n"
+        "You will receive a list of review items, each with an 'id' and 'text'.\n"
+        "Return ONLY a JSON object with a key 'results' containing an array of objects.\n"
+        "Each object MUST include the review 'id' and exactly these score keys as numbers 0-100:\n"
+        f"{', '.join(ALL_SCORE_KEYS)}.\n"
+        "Rubric:\n" + _rubric_lines(axis_labels, gate_labels) + "\n"
+        "disgust: how much irritation/disgust the review expresses (high = bad quality signal).\n"
+        "valence: overall positivity of the review (high = positive).\n"
+        "No markdown, no commentary."
+    )
+
+    formatted_items = []
+    for item in items:
+        text = (item.get("content_text") or "")[:2000]
+        sentiment = item.get("sentiment") or "unknown"
+        formatted_items.append(f"--- ITEM id: {item['id']} (sentiment: {sentiment}) ---\n{text}")
+
+    print(f"🤖 [LLM Batch] Requesting score for {len(items)} review(s)...", flush=True)
+    user = "Score the following perfume reviews:\n\n" + "\n\n".join(formatted_items)
+    raw = _chat_json(system, user)
+    print(f"✅ [LLM Batch] Received response for review batch ({len(items)} items)", flush=True)
+
+    results_list = raw.get("results") if isinstance(raw, dict) else (raw if isinstance(raw, list) else None)
+    if not isinstance(results_list, list):
+        raise ValueError("LLM response did not contain a 'results' list")
+
+    out: Dict[str, Dict[str, float]] = {}
+    for entry in results_list:
+        if not isinstance(entry, dict) or "id" not in entry:
+            continue
+        entry_id = str(entry["id"])
+        try:
+            out[entry_id] = _normalize_scores(entry)
+        except ValueError:
+            continue
+
+    return out
+
+
 def score_review_text(
     content_text: str,
     *,
@@ -146,6 +205,81 @@ def score_review_text(
     )
     user = f"Sentiment filter (if any): {sentiment or 'unknown'}\n\nReview:\n{content_text[:4000]}"
     return _normalize_scores(_chat_json(system, user))
+
+
+def score_opinions_batch(
+    items: List[Dict[str, Any]],
+    *,
+    axis_labels: Optional[Dict[str, str]] = None,
+    gate_labels: Optional[Dict[str, str]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Score a batch of pro/con opinion items in a single LLM call.
+    Each item in `items` should have 'id', 'opinion_text', and optionally 'opinion_type'.
+    Returns a dict mapping item id -> dict containing 8 score keys (0-100) + 'character_relevant' (bool).
+    """
+    if not items:
+        return {}
+    if not is_llm_configured():
+        raise LLMUnavailableError("LLM_BASE_URL is not set")
+
+    axis_labels = axis_labels or {}
+    gate_labels = gate_labels or {}
+
+    system = (
+        "You score short Fragrantica pro/con opinion lines for fragrance emotion research.\n"
+        "You will receive a list of opinion items, each with an 'id', 'type' (pro/con), and 'text'.\n"
+        "Return ONLY a JSON object with a key 'results' containing an array of objects.\n"
+        "Each object MUST include the opinion 'id', these score keys as numbers 0-100:\n"
+        f"{', '.join(ALL_SCORE_KEYS)},\n"
+        "and 'character_relevant' (boolean).\n"
+        "Rubric:\n" + _rubric_lines(axis_labels, gate_labels) + "\n"
+        "disgust: irritation/disgust about the scent itself (high = bad quality signal).\n"
+        "valence: positivity about the scent experience (high = positive).\n"
+        "character_relevant: true ONLY if the opinion describes how the perfume smells "
+        "or feels (scent character, mood, olfactory complaints like polarizing, "
+        "nauseating, sweet, metallic). "
+        "character_relevant: false for price/value, longevity/sillage/performance, "
+        "season or skin chemistry fit, gender suitability, overexposure/popularity, "
+        "dupes/clones, packaging, or anything not about scent character.\n"
+        "If character_relevant is false, still include all score keys (use 0) — "
+        "the caller will discard the row.\n"
+        "No markdown, no commentary."
+    )
+
+    formatted_items = []
+    for item in items:
+        text = (item.get("opinion_text") or "")[:1000]
+        op_type = item.get("opinion_type") or "unknown"
+        formatted_items.append(f"--- ITEM id: {item['id']} (type: {op_type}) ---\n{text}")
+
+    print(f"🤖 [LLM Batch] Requesting score for {len(items)} pro/con opinion(s)...", flush=True)
+    user = "Score the following fragrance opinions:\n\n" + "\n\n".join(formatted_items)
+    raw = _chat_json(system, user)
+    print(f"✅ [LLM Batch] Received response for opinion batch ({len(items)} items)", flush=True)
+
+    results_list = raw.get("results") if isinstance(raw, dict) else (raw if isinstance(raw, list) else None)
+    if not isinstance(results_list, list):
+        raise ValueError("LLM response did not contain a 'results' list")
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for entry in results_list:
+        if not isinstance(entry, dict) or "id" not in entry:
+            continue
+        entry_id = str(entry["id"])
+        relevant = entry.get("character_relevant", True)
+        if isinstance(relevant, str):
+            relevant = relevant.strip().lower() in ("true", "1", "yes")
+        else:
+            relevant = bool(relevant)
+        try:
+            scores = _normalize_scores(entry)
+            scores["character_relevant"] = relevant
+            out[entry_id] = scores
+        except ValueError:
+            continue
+
+    return out
 
 
 def score_opinion_text(
@@ -250,4 +384,7 @@ def generate_ai_overview(
         f"Fragrantica opinions (pros/cons text only):\n{opinions_block}\n\n"
         f"Selected reviews (stratified by sentiment):\n{reviews_block}"
     )
-    return _chat_json(system, user, temperature=AI_OVERVIEW_TEMPERATURE)
+    print(f"🤖 [LLM AI Overview] Requesting synthesis for '{perfume_name}'...", flush=True)
+    res = _chat_json(system, user, temperature=AI_OVERVIEW_TEMPERATURE)
+    print(f"✅ [LLM AI Overview] Synthesized summary for '{perfume_name}'", flush=True)
+    return res
