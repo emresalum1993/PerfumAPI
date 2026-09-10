@@ -61,7 +61,7 @@
 				],
 				"body": {
 					"mode": "raw",
-					"raw": "{\n  \"perfume_url\": \"{{perfumeUrl}}\",\n  \"review_pages\": 5,\n  \"force\": true\n}"
+					"raw": "{\n  \"perfume_url\": \"{{perfumeUrl}}\",\n  \"review_pages\": 5,\n  \"parallel_reviews\": true,\n  \"force\": true\n}"
 				},
 				"url": {
 					"raw": "{{baseUrl}}/pipeline/process-url",
@@ -95,7 +95,7 @@
 				],
 				"body": {
 					"mode": "raw",
-					"raw": "{\n  \"auto\": true,\n  \"limit\": 10,\n  \"review_pages\": 5,\n  \"force\": true\n}"
+					"raw": "{\n  \"auto\": true,\n  \"limit\": 10,\n  \"offset\": 0,\n  \"review_pages\": 5,\n  \"parallel_reviews\": true,\n  \"parallel_perfume_count\": 2,\n  \"force\": true\n}"
 				},
 				"url": {
 					"raw": "{{baseUrl}}/pipeline/process-url",

@@ -128,6 +128,25 @@ async def insert_perfumes_batch(perfumes: List[Dict[str, Any]]) -> int:
         return success_count
 
 
+async def update_perfume_image_nobg(
+    *,
+    fragrantica_id: int,
+    image_url_nobg: str,
+) -> bool:
+    """Set image_url_nobg for one perfume by Fragrantica id."""
+    try:
+        response = (
+            supabase.table("perfumes")
+            .update({"image_url_nobg": image_url_nobg})
+            .eq("fragrantica_id", fragrantica_id)
+            .execute()
+        )
+        return bool(response.data)
+    except Exception as e:
+        print(f"❌ Error updating image_url_nobg for {fragrantica_id}: {e}")
+        return False
+
+
 async def get_all_perfumes(limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
     """
     Retrieve all perfumes from the database with pagination.

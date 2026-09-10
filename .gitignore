@@ -43,6 +43,8 @@ Perfume_API.postman_environment.json
 
 # Data
 data/data.json
+data/images/nobg/*.png
+.pw-fragrantica/
 
 # OS
 .DS_Store

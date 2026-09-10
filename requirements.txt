@@ -7,4 +7,9 @@ python-dotenv==1.0.1
 pydantic==2.10.3
 pycryptodome==3.23.0
 openai==1.109.1
+cloudscraper>=1.2.71
+playwright>=1.49.0
+rembg>=2.0.50
+pillow>=10.0.0
+onnxruntime>=1.16.0
 

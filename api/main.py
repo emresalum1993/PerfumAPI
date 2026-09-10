@@ -114,6 +114,7 @@ class PerfumeBase(BaseModel):
     sillage: Optional[Union[str, float, int]] = None
     image_url: Optional[str] = None
     image_url_og: Optional[str] = None
+    image_url_nobg: Optional[str] = None
     perfume_url: Optional[str] = None
 
     @field_validator(
@@ -181,11 +182,32 @@ class FullProcessUrlRequest(BaseModel):
         le=100,
         description="Number of popular perfumes to scrape and process when auto=true",
     )
+    offset: int = Field(
+        default=0,
+        ge=0,
+        description="Number of popular perfumes to skip from the beginning when auto=true (for pagination)",
+    )
     review_pages: int = Field(
         default=5,
         ge=1,
         le=20,
         description="Number of review pages to scrape per sentiment (positive & negative)",
+    )
+    parallel_reviews: bool = Field(
+        default=False,
+        description="If true, scrape positive and negative reviews concurrently (pages within each sentiment stay sequential)",
+    )
+    parallel_perfumes: int = Field(
+        default=1,
+        ge=1,
+        le=10,
+        description="Number of perfumes to process concurrently when auto=true (default 1)",
+    )
+    parallel_perfume_count: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=10,
+        description="Alias for parallel_perfumes",
     )
     force: bool = Field(
         default=True,
@@ -210,6 +232,10 @@ class FullProcessPopularRequest(BaseModel):
         ge=1,
         le=20,
         description="Number of review pages to scrape per sentiment (positive & negative)",
+    )
+    parallel_reviews: bool = Field(
+        default=False,
+        description="If true, scrape positive and negative reviews concurrently (pages within each sentiment stay sequential)",
     )
     force: bool = Field(
         default=True,
@@ -1114,11 +1140,100 @@ async def pipeline_run_all(
     }
 
 
+async def _scrape_one_sentiment_reviews(
+    *,
+    perfume_id: str,
+    fragrantica_id: int,
+    perfume_url: str,
+    sentiment: str,
+    review_pages: int,
+    max_retries: int = 3,
+) -> tuple[str, int, int]:
+    """Scrape one sentiment with retries. Returns (sentiment, review_count, inserted_count)."""
+    last_error: Optional[Exception] = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            res = await asyncio.to_thread(
+                scrape_fragrantica_reviews,
+                perfume_uuid=perfume_id,
+                fragrantica_id=fragrantica_id,
+                perfume_url=perfume_url,
+                sentiment=sentiment,
+                pages=review_pages,
+            )
+            reviews = res.get("reviews") or []
+            inserted = await upsert_reviews(reviews)
+            print(
+                f"   -> Scraped {len(reviews)} {sentiment} reviews (inserted/updated: {inserted})",
+                flush=True,
+            )
+            return sentiment, len(reviews), inserted
+        except Exception as e:
+            last_error = e
+            print(
+                f"   ⚠️ [Attempt {attempt}/{max_retries}] Review scraping ({sentiment}) failed: {e}",
+                flush=True,
+            )
+            if attempt < max_retries:
+                print(f"   🔄 Retrying {sentiment} review scrape in {5 * attempt}s...", flush=True)
+                await asyncio.sleep(5 * attempt)
+
+    raise HTTPException(
+        status_code=502,
+        detail=f"Failed to scrape {sentiment} reviews for perfume after {max_retries} attempts: {last_error}",
+    )
+
+
+async def _scrape_perfume_reviews_step(
+    *,
+    perfume_id: str,
+    fragrantica_id: int,
+    perfume_url: str,
+    review_pages: int,
+    parallel_reviews: bool,
+) -> int:
+    inserted_total = 0
+    if parallel_reviews:
+        print("📝 [2/5] Scraping reviews in parallel (positive & negative)...", flush=True)
+        results = await asyncio.gather(
+            _scrape_one_sentiment_reviews(
+                perfume_id=perfume_id,
+                fragrantica_id=fragrantica_id,
+                perfume_url=perfume_url,
+                sentiment="positive",
+                review_pages=review_pages,
+            ),
+            _scrape_one_sentiment_reviews(
+                perfume_id=perfume_id,
+                fragrantica_id=fragrantica_id,
+                perfume_url=perfume_url,
+                sentiment="negative",
+                review_pages=review_pages,
+            ),
+        )
+        inserted_total = sum(r[2] for r in results)
+    else:
+        print("📝 [2/5] Scraping reviews (positive & negative pages)...", flush=True)
+        for sentiment in ("positive", "negative"):
+            _, _, inserted = await _scrape_one_sentiment_reviews(
+                perfume_id=perfume_id,
+                fragrantica_id=fragrantica_id,
+                perfume_url=perfume_url,
+                sentiment=sentiment,
+                review_pages=review_pages,
+            )
+            inserted_total += inserted
+
+    print(f"✅ [2/5] Finished reviews scrape. Total new reviews added: {inserted_total}", flush=True)
+    return inserted_total
+
+
 async def _execute_master_pipeline(
     perfume_url: str,
     review_pages: int = 5,
     force: bool = True,
     rescore: bool = False,
+    parallel_reviews: bool = False,
 ):
     perfume_url = perfume_url.strip()
     if not perfume_url or "fragrantica.com/perfume/" not in perfume_url:
@@ -1158,38 +1273,13 @@ async def _execute_master_pipeline(
     # Step 2: Scrape Reviews (Positive & Negative)
     reviews_scraped_count = 0
     if fragrantica_id:
-        print(f"📝 [2/5] Scraping reviews (positive & negative pages)...", flush=True)
-        for sentiment in ("positive", "negative"):
-            max_sentiment_retries = 3
-            sentiment_success = False
-            for sentiment_attempt in range(1, max_sentiment_retries + 1):
-                try:
-                    res = await asyncio.to_thread(
-                        scrape_fragrantica_reviews,
-                        perfume_uuid=perfume_id,
-                        fragrantica_id=int(fragrantica_id),
-                        perfume_url=perfume_url,
-                        sentiment=sentiment,
-                        pages=review_pages,
-                    )
-                    reviews = res.get("reviews") or []
-                    inserted = await upsert_reviews(reviews)
-                    reviews_scraped_count += inserted
-                    print(f"   -> Scraped {len(reviews)} {sentiment} reviews (inserted/updated: {inserted})", flush=True)
-                    sentiment_success = True
-                    break
-                except Exception as e:
-                    print(f"   ⚠️ [Attempt {sentiment_attempt}/{max_sentiment_retries}] Review scraping ({sentiment}) failed: {e}", flush=True)
-                    if sentiment_attempt < max_sentiment_retries:
-                        print(f"   🔄 Retrying {sentiment} review scrape in {5 * sentiment_attempt}s...", flush=True)
-                        await asyncio.sleep(5 * sentiment_attempt)
-
-            if not sentiment_success:
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"Failed to scrape {sentiment} reviews for perfume after {max_sentiment_retries} attempts",
-                )
-        print(f"✅ [2/5] Finished reviews scrape. Total new reviews added: {reviews_scraped_count}", flush=True)
+        reviews_scraped_count = await _scrape_perfume_reviews_step(
+            perfume_id=perfume_id,
+            fragrantica_id=int(fragrantica_id),
+            perfume_url=perfume_url,
+            review_pages=review_pages,
+            parallel_reviews=parallel_reviews,
+        )
 
     # Step 3: Check notes & Score Reviews (Batched LLM)
     print(f"🧠 [3/5] Scoring reviews with batched LLM & checking unmapped notes...", flush=True)
@@ -1261,7 +1351,7 @@ async def pipeline_process_url(
 
     Modes:
     1. Single URL Mode: Pass `perfume_url` (e.g. `{"perfume_url": "https://...", "review_pages": 5, "force": true}`)
-    2. Auto Limit Mode: Pass `auto: true` and `limit` (e.g. `{"auto": true, "limit": 10, "review_pages": 5, "force": true}`)
+    2. Auto Limit Mode: Pass `auto: true`, `limit`, and optional `offset` (e.g. `{"auto": true, "limit": 10, "offset": 10, "review_pages": 5, "force": true}`)
 
     In ONE request, this endpoint will run all 5 steps for the perfume(s):
     1. Scrape perfume details (notes, accords, pros/cons)
@@ -1276,10 +1366,15 @@ async def pipeline_process_url(
         from scraper.scrape import FragranticaScraper
 
         limit = request.limit or 10
-        print(f"\n🚀 [AUTOMATIC BULK PIPELINE] Discovering top {limit} popular perfumes from Fragrantica...", flush=True)
+        offset = request.offset or 0
+        concurrency = request.parallel_perfumes
+        if request.parallel_perfume_count is not None:
+            concurrency = request.parallel_perfume_count
+
+        print(f"\n🚀 [AUTOMATIC BULK PIPELINE] Discovering popular perfumes from Fragrantica (limit={limit}, offset={offset}, parallel_perfumes={concurrency})...", flush=True)
 
         scraper = FragranticaScraper(delay=17.0)
-        urls = await asyncio.to_thread(scraper.get_popular_perfumes_urls, limit=limit)
+        urls = await asyncio.to_thread(scraper.get_popular_perfumes_urls, limit=limit, offset=offset)
 
         if not urls:
             return {
@@ -1289,39 +1384,47 @@ async def pipeline_process_url(
                 "results": [],
             }
 
-        print(f"Found {len(urls)} popular perfume URLs to process. Beginning sequential master pipeline...\n", flush=True)
+        print(f"Found {len(urls)} popular perfume URLs to process (concurrency={concurrency}). Beginning master pipeline...\n", flush=True)
 
-        results = []
-        for idx, url in enumerate(urls, 1):
-            print(f"▶️ Processing perfume [{idx}/{len(urls)}]: {url}", flush=True)
-            try:
-                res = await _execute_master_pipeline(
-                    perfume_url=url,
-                    review_pages=request.review_pages,
-                    force=request.force,
-                    rescore=request.rescore,
-                )
-                results.append({
-                    "url": url,
-                    "status": "success",
-                    "perfume_id": res.get("perfume_id"),
-                    "perfume_name": res.get("perfume", {}).get("name"),
-                })
-            except Exception as e:
-                print(f"❌ Failed processing {url}: {e}", flush=True)
-                results.append({
-                    "url": url,
-                    "status": "error",
-                    "error": str(e),
-                })
+        sem = asyncio.Semaphore(concurrency)
+
+        async def _process_single(idx: int, url: str):
+            async with sem:
+                print(f"▶️ Processing perfume [{idx}/{len(urls)}]: {url}", flush=True)
+                try:
+                    res = await _execute_master_pipeline(
+                        perfume_url=url,
+                        review_pages=request.review_pages,
+                        force=request.force,
+                        rescore=request.rescore,
+                        parallel_reviews=request.parallel_reviews,
+                    )
+                    return {
+                        "url": url,
+                        "status": "success",
+                        "perfume_id": res.get("perfume_id"),
+                        "perfume_name": res.get("perfume", {}).get("name"),
+                    }
+                except Exception as e:
+                    print(f"❌ Failed processing {url}: {e}", flush=True)
+                    return {
+                        "url": url,
+                        "status": "error",
+                        "error": str(e),
+                    }
+
+        tasks = [_process_single(idx, url) for idx, url in enumerate(urls, 1)]
+        results = await asyncio.gather(*tasks)
 
         return {
             "status": "success",
             "mode": "auto",
             "requested_limit": limit,
+            "requested_offset": offset,
+            "parallel_perfumes": concurrency,
             "found_urls": len(urls),
             "successful_count": sum(1 for r in results if r["status"] == "success"),
-            "results": results,
+            "results": list(results),
         }
 
     # Otherwise, Single URL Mode
@@ -1337,6 +1440,7 @@ async def pipeline_process_url(
         review_pages=request.review_pages,
         force=request.force,
         rescore=request.rescore,
+        parallel_reviews=request.parallel_reviews,
     )
 
 
@@ -1378,6 +1482,7 @@ async def pipeline_process_popular(
                 review_pages=request.review_pages,
                 force=request.force,
                 rescore=request.rescore,
+                parallel_reviews=request.parallel_reviews,
             )
             results.append({
                 "url": url,

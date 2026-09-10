@@ -13,6 +13,9 @@ from typing import List, Dict, Any, Optional, Tuple
 import re
 import random
 from urllib.parse import parse_qsl, urlparse
+from dotenv import load_dotenv
+
+load_dotenv()
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.fragrantica_crypto import (
@@ -23,11 +26,28 @@ from utils.fragrantica_crypto import (
     normalize_similar_perfumes,
     normalize_reviews_payload,
 )
+from scraper.playwright_cookies import (
+    load_cached_session,
+    export_session_cookies,
+    headed_scrape_get,
+    headed_scrape_post,
+    headed_scrape_wait_clearance,
+)
 
 
 # Known category keys on Fragrantica tw-rating-card sections (DOM fallback)
 SENTIMENT_KEYS = ('love', 'like', 'ok', 'dislike', 'hate')
 WHEN_TO_WEAR_KEYS = ('winter', 'spring', 'summer', 'fall', 'day', 'night')
+
+# Used when FRAGRANTICA_COOKIES is set; override via FRAGRANTICA_USER_AGENT to match your browser.
+DEFAULT_IMPORTED_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+
+def _env_truthy(name: str) -> bool:
+    return (os.getenv(name) or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 class FragranticaScraper:
@@ -43,7 +63,63 @@ class FragranticaScraper:
         Args:
             delay: Minimum delay between requests in seconds (default 17.0)
         """
-        self.delay = delay
+        imported_cookies = (os.getenv("FRAGRANTICA_COOKIES") or "").strip()
+        self.using_playwright_scrape = _env_truthy("FRAGRANTICA_PW_SCRAPE")
+        self.using_imported_cookies = bool(imported_cookies) and not self.using_playwright_scrape
+        self.using_playwright_session = self.using_playwright_scrape or (
+            not self.using_imported_cookies and _env_truthy("USE_PLAYWRIGHT_SESSION")
+        )
+        self.using_cloudscraper = (
+            not self.using_imported_cookies
+            and not self.using_playwright_session
+            and not self.using_playwright_scrape
+            and _env_truthy("USE_CLOUDSCRAPER")
+        )
+        self.using_session_cookies = self.using_imported_cookies or self.using_playwright_session
+        self.session_cookie_header: Optional[str] = imported_cookies or None
+        self.session_user_agent: Optional[str] = None
+        self._playwright_refresh_used = False
+
+        if self.using_imported_cookies:
+            self.delay = float(os.getenv("FRAGRANTICA_DELAY", "3.0"))
+            self.session_user_agent = self._cookie_user_agent()
+            print(
+                f"🍪 Using imported browser cookies ({len(imported_cookies.split(';'))} pairs); "
+                f"request delay={self.delay}s",
+                flush=True,
+            )
+        elif self.using_playwright_scrape:
+            self.delay = float(os.getenv("FRAGRANTICA_DELAY", "3.0"))
+            print(
+                f"🎭 Headed Playwright scrape (FRAGRANTICA_PW_SCRAPE); delay={self.delay}s",
+                flush=True,
+            )
+        elif self.using_playwright_session:
+            self.delay = float(os.getenv("FRAGRANTICA_DELAY", "3.0"))
+            cached = load_cached_session()
+            if cached:
+                self.session_cookie_header = cached["cookie_header"]
+                self.session_user_agent = cached.get("user_agent") or self._cookie_user_agent()
+                print(
+                    f"🎭 Using Playwright profile cookies ({len(self.session_cookie_header.split(';'))} pairs); "
+                    f"request delay={self.delay}s",
+                    flush=True,
+                )
+            else:
+                print(
+                    "🎭 USE_PLAYWRIGHT_SESSION enabled but no cached cookies. "
+                    "Run: python scripts/bootstrap_fragrantica_session.py",
+                    flush=True,
+                )
+        elif self.using_cloudscraper:
+            self.delay = float(os.getenv("FRAGRANTICA_DELAY", "3.0"))
+            print(
+                f"☁️  Using cloudscraper for Cloudflare bypass; request delay={self.delay}s",
+                flush=True,
+            )
+        else:
+            self.delay = delay
+
         self.max_retries = 5  # Retry up to 5 times on 403/429/network errors
         self.retry_delay = 15  # Base retry delay for errors
         self.request_count = 0  # Track requests for progressive slowdown
@@ -71,9 +147,58 @@ class FragranticaScraper:
         self.base_url = "https://www.fragrantica.com"
         self._reset_session()
 
+    def _cookie_user_agent(self) -> str:
+        if self.session_user_agent:
+            return self.session_user_agent
+        return (os.getenv("FRAGRANTICA_USER_AGENT") or "").strip() or DEFAULT_IMPORTED_USER_AGENT
+
+    def _apply_session_cookies(self) -> None:
+        if self.session_cookie_header:
+            self.session.headers["Cookie"] = self.session_cookie_header
+            self.session.headers["User-Agent"] = self._cookie_user_agent()
+
+    def _refresh_playwright_session(self) -> bool:
+        if self.using_playwright_scrape:
+            print("🎭 Waiting for Cloudflare in the open Chrome window...", flush=True)
+            return headed_scrape_wait_clearance()
+        if not self.using_playwright_session or self._playwright_refresh_used:
+            return False
+        if not _env_truthy("FRAGRANTICA_PW_AUTO_REFRESH"):
+            return False
+        self._playwright_refresh_used = True
+        print("🎭 Refreshing Playwright session (headed Chrome)...", flush=True)
+        try:
+            session = export_session_cookies(wait_for_human=False)
+            self.session_cookie_header = session["cookie_header"]
+            self.session_user_agent = session.get("user_agent") or self._cookie_user_agent()
+            self._apply_session_cookies()
+            return True
+        except Exception as exc:
+            print(f"❌ Playwright session refresh failed: {exc}", flush=True)
+            return False
+
+    def _create_session(self):
+        if self.using_cloudscraper:
+            import ssl
+
+            import certifi
+            import cloudscraper
+
+            ssl_context = ssl.create_default_context(cafile=certifi.where())
+            return cloudscraper.create_scraper(
+                browser="chrome",
+                interpreter=(os.getenv("FRAGRANTICA_CLOUDSCRAPER_INTERPRETER") or "js2py").strip(),
+                debug=_env_truthy("FRAGRANTICA_CLOUDSCRAPER_DEBUG"),
+                ssl_context=ssl_context,
+            )
+        return requests.Session()
+
+    def _apply_imported_cookies(self) -> None:
+        self._apply_session_cookies()
+
     def _reset_session(self):
-        """Create a fresh requests session with a random User-Agent."""
-        self.session = requests.Session()
+        """Create a fresh HTTP session (requests or cloudscraper)."""
+        self.session = self._create_session()
         self.session.headers.update({
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.9',
@@ -86,29 +211,107 @@ class FragranticaScraper:
             'Sec-Fetch-Site': 'same-origin',
             'Cache-Control': 'max-age=0'
         })
+        if self.using_session_cookies:
+            self._apply_session_cookies()
+        elif not self.using_cloudscraper:
+            self._set_request_user_agent()
+        elif (os.getenv("FRAGRANTICA_USER_AGENT") or "").strip():
+            self.session.headers["User-Agent"] = self._cookie_user_agent()
+
+    def _set_request_user_agent(self) -> None:
+        if self.using_session_cookies or self.using_cloudscraper:
+            override = (os.getenv("FRAGRANTICA_USER_AGENT") or "").strip()
+            if override:
+                self.session.headers["User-Agent"] = override
+            elif self.using_session_cookies:
+                self.session.headers["User-Agent"] = self._cookie_user_agent()
+            return
+        self.session.headers["User-Agent"] = random.choice(self.user_agents)
+
+    def _request_backoff(self, attempt: int, status_code: Optional[int] = None) -> None:
+        wait = min(45, 10 * attempt)
+        if status_code in (403, 429):
+            if self.using_playwright_session and self._refresh_playwright_session():
+                wait = 3
+                print(
+                    f"⚠️  Received HTTP {status_code}. Playwright cookies refreshed; retrying...",
+                    flush=True,
+                )
+            elif self.using_imported_cookies:
+                print(
+                    f"⚠️  Received HTTP {status_code}. Waiting {wait}s "
+                    f"(attempt {attempt}/{self.max_retries}). "
+                    f"If this persists, refresh FRAGRANTICA_COOKIES from Chrome.",
+                    flush=True,
+                )
+            elif self.using_cloudscraper:
+                print(
+                    f"⚠️  Received HTTP {status_code}. Refreshing cloudscraper session & waiting {wait}s "
+                    f"(attempt {attempt}/{self.max_retries})...",
+                    flush=True,
+                )
+                self._reset_session()
+            else:
+                print(
+                    f"⚠️  Received HTTP {status_code}. Resetting session & waiting {wait}s "
+                    f"(attempt {attempt}/{self.max_retries})...",
+                    flush=True,
+                )
+                self._reset_session()
+        time.sleep(wait)
+        if self.using_session_cookies:
+            self._apply_session_cookies()
+
+    def _post_request_delay(self) -> None:
+        if self.using_session_cookies or self.using_cloudscraper:
+            actual_delay = max(1.0, self.delay + random.uniform(-0.5, 0.5))
+            print(f"⏳ Waiting {actual_delay:.1f} seconds...")
+            time.sleep(actual_delay)
+            return
+
+        if self.request_count % random.randint(5, 10) == 0:
+            reading_pause = random.uniform(15, 30)
+            print(f"📖 Reading pause for {reading_pause:.1f}s...")
+            time.sleep(reading_pause)
+
+        progressive_delay = (self.request_count // 20) * 2
+        base_delay = self.delay + progressive_delay
+        actual_delay = max(5.0, base_delay + random.uniform(-base_delay * 0.3, base_delay * 0.3))
+        print(f"⏳ Waiting {actual_delay:.1f} seconds...")
+        time.sleep(actual_delay)
     
     def _get_page(self, url: str) -> Optional[BeautifulSoup]:
         """
         Fetch and parse a web page with robust retry logic for 403 / 429 rate limiting.
         """
+        self._playwright_refresh_used = False
         for attempt in range(1, self.max_retries + 1):
             try:
-                # Rotate User-Agent to appear like different users
-                self.session.headers['User-Agent'] = random.choice(self.user_agents)
+                print(f"📡 Fetching: {url} (attempt {attempt}/{self.max_retries})")
+                if self.using_playwright_scrape:
+                    status_code, html = headed_scrape_get(url)
+                    if status_code in (403, 429):
+                        self._request_backoff(attempt, status_code)
+                        continue
+                    if status_code >= 400:
+                        raise RuntimeError(f"HTTP {status_code}")
+                    self.last_url = url
+                    self.request_count += 1
+                    self._post_request_delay()
+                    self.last_html = html
+                    return BeautifulSoup(html, 'html.parser')
+
+                self._set_request_user_agent()
                 if self.last_url:
                     self.session.headers['Referer'] = self.last_url
                 else:
                     self.session.headers['Referer'] = self.base_url
-                
-                print(f"📡 Fetching: {url} (attempt {attempt}/{self.max_retries})")
+
                 response = self.session.get(url, timeout=20)
                 
                 # Handle rate limiting or Cloudflare blocks (429 / 403)
                 if response.status_code in (403, 429):
-                    wait = min(45, 10 * attempt)
-                    print(f"⚠️  Received HTTP {response.status_code} for {url}. Resetting session & waiting {wait}s (attempt {attempt}/{self.max_retries})...")
-                    time.sleep(wait)
-                    self._reset_session()
+                    self._request_backoff(attempt, response.status_code)
                     continue
                 
                 response.raise_for_status()
@@ -116,20 +319,7 @@ class FragranticaScraper:
                 # Update last URL for next referer
                 self.last_url = url
                 self.request_count += 1
-                
-                # Random pause every 5-10 requests
-                if self.request_count % random.randint(5, 10) == 0:
-                    reading_pause = random.uniform(15, 30)
-                    print(f"📖 Reading pause for {reading_pause:.1f}s...")
-                    time.sleep(reading_pause)
-                
-                # Progressive slowdown
-                progressive_delay = (self.request_count // 20) * 2
-                base_delay = self.delay + progressive_delay
-                actual_delay = max(5.0, base_delay + random.uniform(-base_delay * 0.3, base_delay * 0.3))
-                
-                print(f"⏳ Waiting {actual_delay:.1f} seconds...")
-                time.sleep(actual_delay)
+                self._post_request_delay()
                 
                 self.last_html = response.text
                 return BeautifulSoup(response.text, 'html.parser')
@@ -138,11 +328,14 @@ class FragranticaScraper:
                 wait = min(45, 10 * attempt)
                 print(f"❌ Error fetching {url}: {e}. Resetting session & waiting {wait}s (attempt {attempt}/{self.max_retries})...")
                 time.sleep(wait)
-                self._reset_session()
+                if self.using_playwright_session:
+                    self._refresh_playwright_session()
+                elif not self.using_imported_cookies:
+                    self._reset_session()
+                else:
+                    self._apply_session_cookies()
                 
         print(f"❌ Max retries ({self.max_retries}) reached for {url}")
-        self.last_html = None
-        return None
         self.last_html = None
         return None
     
@@ -207,22 +400,24 @@ class FragranticaScraper:
         print(f"⚠️  Could not extract designer ID from {brand_url}")
         return None
     
-    def get_popular_perfumes_urls(self, limit: int = 1000) -> List[str]:
+    def get_popular_perfumes_urls(self, limit: int = 1000, offset: int = 0) -> List[str]:
         """
         Get URLs of popular perfumes from search page.
         
         Args:
             limit: Maximum number of perfume URLs to retrieve
+            offset: Number of perfume URLs to skip from the beginning
             
         Returns:
             List of perfume URLs
         """
         perfume_urls = []
         page = 1
+        target_count = limit + offset
         
-        print(f"🔍 Searching for up to {limit} popular perfumes...")
+        print(f"🔍 Searching for up to {limit} popular perfumes (offset={offset})...")
         
-        while len(perfume_urls) < limit:
+        while len(perfume_urls) < target_count:
             # Fragrantica search URL for most popular perfumes
             search_url = f"{self.base_url}/search/"
             
@@ -259,7 +454,7 @@ class FragranticaScraper:
                     found_on_page += 1
                     print(f"  Found perfume {len(perfume_urls)}: {perfume_url}")
                     
-                    if len(perfume_urls) >= limit:
+                    if len(perfume_urls) >= target_count:
                         break
             
             # If no new perfumes found on this page, stop
@@ -274,8 +469,9 @@ class FragranticaScraper:
                 print("⚠️  Reached page limit (50)")
                 break
         
-        print(f"✅ Found {len(perfume_urls)} perfume URLs")
-        return perfume_urls[:limit]
+        sliced_urls = perfume_urls[offset:target_count]
+        print(f"✅ Found {len(perfume_urls)} total URLs, returning {len(sliced_urls)} perfume URLs (skipped first {offset})")
+        return sliced_urls
     
     def get_brand_perfumes_urls(self, brand_name: str, limit: int = 100) -> List[str]:
         """
@@ -311,7 +507,7 @@ class FragranticaScraper:
         ajax_url = f"{self.base_url}/ajax.php?designerSimpleList"
         
         # Rotate User-Agent for AJAX request
-        self.session.headers['User-Agent'] = random.choice(self.user_agents)
+        self._set_request_user_agent()
         
         # Update referer to brand page (simulate clicking from that page)
         self.session.headers['Referer'] = brand_url
@@ -321,30 +517,39 @@ class FragranticaScraper:
             
             # POST request with form data
             form_data = f"action=simple.perfume.list&designer_id={designer_id}&mode=popular"
-            
-            response = self.session.post(
-                ajax_url,
-                data=form_data,
-                headers={'Content-Type': 'application/x-www-form-urlencoded'},
-                timeout=15
-            )
-            
-            # Handle rate limiting
-            if response.status_code == 429:
-                print(f"⚠️  Rate limited (429). Waiting {self.retry_delay} seconds...")
-                time.sleep(self.retry_delay)
-                return []
-            
-            response.raise_for_status()
-            
+            ajax_headers = {'Content-Type': 'application/x-www-form-urlencoded'}
+
+            if self.using_playwright_scrape:
+                status_code, body = headed_scrape_post(ajax_url, form_data, ajax_headers)
+                if status_code == 429:
+                    print(f"⚠️  Rate limited (429). Waiting {self.retry_delay} seconds...")
+                    time.sleep(self.retry_delay)
+                    return []
+                if status_code >= 400:
+                    raise RuntimeError(f"HTTP {status_code}")
+                soup = BeautifulSoup(body, 'html.parser')
+            else:
+                response = self.session.post(
+                    ajax_url,
+                    data=form_data,
+                    headers=ajax_headers,
+                    timeout=15
+                )
+
+                # Handle rate limiting
+                if response.status_code == 429:
+                    print(f"⚠️  Rate limited (429). Waiting {self.retry_delay} seconds...")
+                    time.sleep(self.retry_delay)
+                    return []
+
+                response.raise_for_status()
+                soup = BeautifulSoup(response.text, 'html.parser')
+
             # Update last URL for next referer
             self.last_url = brand_url
             
             # Increment request counter
             self.request_count += 1
-            
-            # Parse the HTML response
-            soup = BeautifulSoup(response.text, 'html.parser')
             
             # Find all perfume links with pattern /perfume/Brand/Name-ID.html
             perfume_links = soup.find_all('a', href=re.compile(r'/perfume/[^/]+/[^/]+\.html'))
@@ -633,6 +838,7 @@ class FragranticaScraper:
                 'sillage': None,
                 'image_url': None,
                 'image_url_og': None,
+                'image_url_nobg': None,
             }
             
             # Extract name and gender from h1 title
@@ -976,6 +1182,13 @@ class FragranticaScraper:
 
             # Higher-quality / social image
             perfume_data['image_url_og'] = self._extract_og_image(soup, perfume_data.get('fragrantica_id'))
+
+            try:
+                from utils.image_nobg import save_nobg_thumbnail
+
+                save_nobg_thumbnail(perfume_data)
+            except ImportError:
+                pass
             
             print(f"✅ Extracted: {perfume_data.get('name', 'Unknown')} by {perfume_data.get('brand', 'Unknown')}")
             return perfume_data
@@ -984,6 +1197,18 @@ class FragranticaScraper:
             print(f"❌ Error extracting perfume data from {url}: {str(e)}")
             return None
     
+    def _warm_session(self) -> None:
+        print("🌐 Establishing session with Fragrantica...")
+        if self.using_playwright_scrape:
+            self._get_page(self.base_url)
+            return
+        try:
+            self._set_request_user_agent()
+            self.session.get(self.base_url, timeout=15)
+            time.sleep(3)
+        except Exception as e:
+            print(f"⚠️  Warning: Could not establish initial session: {e}")
+
     def scrape_perfumes(self, limit: int = 2, save_to_file: bool = True) -> List[Dict[str, Any]]:
         """
         Main scraping function: get perfume URLs and extract details.
@@ -996,16 +1221,7 @@ class FragranticaScraper:
             List of perfume dictionaries
         """
         print(f"🚀 Starting scrape for {limit} perfumes...")
-        
-        # Visit homepage first to establish session and get cookies
-        print("🌐 Establishing session with Fragrantica...")
-        try:
-            # Rotate User-Agent for initial session
-            self.session.headers['User-Agent'] = random.choice(self.user_agents)
-            self.session.get(self.base_url, timeout=15)
-            time.sleep(3)  # Brief pause after initial connection
-        except Exception as e:
-            print(f"⚠️  Warning: Could not establish initial session: {e}")
+        self._warm_session()
         
         # Get perfume URLs
         urls = self.get_popular_perfumes_urls(limit)
@@ -1046,16 +1262,7 @@ class FragranticaScraper:
             List of perfume dictionaries
         """
         print(f"🚀 Starting scrape for {brand_name} (up to {limit} perfumes)...")
-        
-        # Visit homepage first to establish session and get cookies
-        print("🌐 Establishing session with Fragrantica...")
-        try:
-            # Rotate User-Agent for initial session
-            self.session.headers['User-Agent'] = random.choice(self.user_agents)
-            self.session.get(self.base_url, timeout=15)
-            time.sleep(3)  # Brief pause after initial connection
-        except Exception as e:
-            print(f"⚠️  Warning: Could not establish initial session: {e}")
+        self._warm_session()
         
         # Get perfume URLs for this brand
         urls = self.get_brand_perfumes_urls(brand_name, limit)
@@ -1139,16 +1346,7 @@ class FragranticaScraper:
             return None
         
         print(f"🚀 Scraping perfume from URL: {perfume_url}")
-        
-        # Visit homepage first to establish session and get cookies
-        print("🌐 Establishing session with Fragrantica...")
-        try:
-            # Rotate User-Agent for initial session
-            self.session.headers['User-Agent'] = random.choice(self.user_agents)
-            self.session.get(self.base_url, timeout=15)
-            time.sleep(3)  # Brief pause after initial connection
-        except Exception as e:
-            print(f"⚠️  Warning: Could not establish initial session: {e}")
+        self._warm_session()
         
         # Extract perfume details
         perfume_data = self.extract_perfume_details(perfume_url)
@@ -1169,10 +1367,31 @@ class FragranticaScraper:
         """POST reviews4perfume_v2 and decrypt the CryptoJS response with retry logic."""
         ts = int(time.time() * 1000)
         url = f"{self.base_url}/ajax.php?reviews4perfume_v2&{ts}"
+        self._playwright_refresh_used = False
 
         for attempt in range(1, self.max_retries + 1):
             try:
-                self.session.headers["User-Agent"] = random.choice(self.user_agents)
+                if self.using_playwright_scrape:
+                    status_code, body = headed_scrape_post(
+                        url,
+                        form,
+                        {
+                            "Referer": referer,
+                            "Origin": self.base_url,
+                            "Accept": "application/json, text/plain, */*",
+                        },
+                    )
+                    if status_code in (403, 429):
+                        self._request_backoff(attempt, status_code)
+                        continue
+                    if status_code >= 400:
+                        raise RuntimeError(f"HTTP {status_code}")
+                    blob = json.loads(body)
+                    if not isinstance(blob, dict) or "ct" not in blob:
+                        raise ValueError("Unexpected reviews response (not a CryptoJS blob)")
+                    return decrypt_cryptojs_blob(blob)
+
+                self._set_request_user_agent()
                 self.session.headers["Referer"] = referer
                 self.session.headers["Origin"] = self.base_url
                 self.session.headers["Accept"] = "application/json, text/plain, */*"
@@ -1183,10 +1402,7 @@ class FragranticaScraper:
 
                 response = self.session.post(url, data=form, timeout=20)
                 if response.status_code in (403, 429):
-                    wait = min(45, 10 * attempt)
-                    print(f"⚠️  Reviews AJAX returned status {response.status_code}. Resetting session & waiting {wait}s (attempt {attempt}/{self.max_retries})...")
-                    time.sleep(wait)
-                    self._reset_session()
+                    self._request_backoff(attempt, response.status_code)
                     continue
 
                 response.raise_for_status()
@@ -1199,7 +1415,12 @@ class FragranticaScraper:
                 wait = min(45, 10 * attempt)
                 print(f"❌ Error in reviews AJAX: {e}. Resetting session & retrying in {wait}s (attempt {attempt}/{self.max_retries})...")
                 time.sleep(wait)
-                self._reset_session()
+                if self.using_playwright_session:
+                    self._refresh_playwright_session()
+                elif not self.using_imported_cookies:
+                    self._reset_session()
+                else:
+                    self._apply_session_cookies()
 
         print(f"❌ Max retries reached for reviews AJAX POST")
         return None
